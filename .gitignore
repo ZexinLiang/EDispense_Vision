@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+output/
+*.jpg
+!data/1.jpg
+.DS_Store
