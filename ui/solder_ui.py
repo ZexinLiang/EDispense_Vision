@@ -69,6 +69,8 @@ class PinchZoomLabel(QLabel):
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._original_pixmap = None
+        self._gesture_active = False
+        self._press_pos = None
 
     def setDisplayPixmap(self, pixmap):
         """供外部调用：存储原始pixmap并应用当前缩放"""
@@ -116,12 +118,53 @@ class PinchZoomLabel(QLabel):
         cropped = scaled.copy(x, y, crop_w, crop_h)
         super().setPixmap(cropped)
 
+    def mousePressEvent(self, ev):
+        """记录按下位置，松手时判定是否为有效点击"""
+        self._press_pos = ev.pos()
+        self._gesture_active = False
+        super().mousePressEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        """松手时：非手势中且移动距离小才算有效点击"""
+        if (self._press_pos is not None
+            and not self._gesture_active
+            and self._original_pixmap and self.width() > 0):
+            # 检查移动距离
+            dx = ev.x() - self._press_pos.x()
+            dy = ev.y() - self._press_pos.y()
+            if (dx * dx + dy * dy) < 225:  # 15px以内算点击
+                pm = self._original_pixmap
+                label_w, label_h = self.width(), self.height()
+                base_scale = min(label_w / pm.width(), label_h / pm.height()) * self._zoom
+                img_w = pm.width() * base_scale
+                img_h = pm.height() * base_scale
+                off_x = (label_w - min(img_w, label_w)) / 2
+                off_y = (label_h - min(img_h, label_h)) / 2
+                if self._zoom <= 1.0:
+                    x_ratio = (ev.x() - off_x) / img_w if img_w > 0 else 0
+                    y_ratio = (ev.y() - off_y) / img_h if img_h > 0 else 0
+                else:
+                    cx = img_w / 2 - self._pan_x
+                    cy = img_h / 2 - self._pan_y
+                    view_x = max(0, cx - label_w / 2)
+                    view_y = max(0, cy - label_h / 2)
+                    x_ratio = (ev.x() + view_x) / img_w if img_w > 0 else 0
+                    y_ratio = (ev.y() + view_y) / img_h if img_h > 0 else 0
+                x_ratio = max(0.0, min(1.0, x_ratio))
+                y_ratio = max(0.0, min(1.0, y_ratio))
+                main_win = self.window()
+                if hasattr(main_win, '_on_image_clicked'):
+                    main_win._on_image_clicked(x_ratio, y_ratio)
+        self._press_pos = None
+        super().mouseReleaseEvent(ev)
+
     def event(self, ev):
         if ev.type() == ev.Gesture:
             return self._gesture_event(ev)
         return super().event(ev)
 
     def _gesture_event(self, ev):
+        self._gesture_active = True
         pinch = ev.gesture(Qt.PinchGesture)
         if pinch:
             if pinch.state() == Qt.GestureUpdated:
@@ -259,6 +302,11 @@ class InferenceThread(QThread):
 
     def set_camera(self, cam_id):
         self.cap = cv2.VideoCapture(cam_id)
+        # 设置MJPG编码 + 1920x1080全高清采集
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.mode = 'camera'
 
     def set_image(self, img):
@@ -677,6 +725,8 @@ class MainWindow(QMainWindow):
         self.infer_thread.set_camera(cam_id)
         self.infer_thread.start()
         self._frozen = False
+        self._edit_mode = False
+        self._selection_mask = []
         self.path_result = None
         self.btn_execute.setEnabled(False)
         self.btn_start.setEnabled(False)
@@ -695,6 +745,59 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
+        # 点锡模式停止后进入编辑选中模式
+        if self.current_mode == 'solder' and self.current_detections:
+            # 仅首次进入编辑模式时初始化为全选；已在编辑模式则保留之前的选中状态
+            if not self._edit_mode or len(self._selection_mask) != len(self.current_detections):
+                self._selection_mask = [True] * len(self.current_detections)
+            self._edit_mode = True
+            self._redraw_edit_frame()
+            self.log("◎ 编辑模式：点击框可取消/恢复选中")
+
+
+    def _redraw_edit_frame(self):
+        """在编辑模式下重绘帧：选中的加蒙版，未选中的只有边框"""
+        if self.current_frame is None:
+            return
+        vis = self.current_frame.copy()
+        for i, det in enumerate(self.current_detections):
+            bbox, score, cls_id = det
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            if self._selection_mask[i]:
+                # 选中：画蒙版 + 边框
+                overlay = vis.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 160, 0), -1)
+                vis = cv2.addWeighted(overlay, 0.35, vis, 0.65, 0)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            else:
+                # 未选中：稍暗绿色细框，无蒙版
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
+        self.display_frame(vis)
+
+    def _on_image_clicked(self, x_ratio, y_ratio):
+        """图像区域被点击（坐标为相对于图像的0~1比例）"""
+        if not self._edit_mode or not self.current_detections:
+            return
+        # 将比例坐标转为原图像素坐标
+        h, w = self.current_frame.shape[:2]
+        px, py = int(x_ratio * w), int(y_ratio * h)
+        # 找到点击的是哪个框（从小到大，优先点小框）
+        clicked_idx = -1
+        min_area = float('inf')
+        for i, det in enumerate(self.current_detections):
+            bbox = det[0]
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                area = (x2 - x1) * (y2 - y1)
+                if area < min_area:
+                    min_area = area
+                    clicked_idx = i
+        if clicked_idx >= 0:
+            self._selection_mask[clicked_idx] = not self._selection_mask[clicked_idx]
+            state = "选中" if self._selection_mask[clicked_idx] else "取消"
+            self.log(f"◎ 框{clicked_idx} {state}")
+            self._redraw_edit_frame()
+
     def capture_frame(self):
         """点锡模式：生成路径；AOI模式：锁定当前帧"""
         if self.current_mode != "solder":
@@ -702,6 +805,9 @@ class MainWindow(QMainWindow):
             return
         frame = self.current_frame.copy() if self.current_frame is not None else None
         detections = list(self.current_detections) if self.current_detections else []
+        # 编辑模式下只用选中的检测结果
+        if self._edit_mode and self._selection_mask and detections:
+            detections = [d for d, sel in zip(detections, self._selection_mask) if sel]
 
         if frame is None:
             self.log("⚠ 无画面，请先启动摄像头")
