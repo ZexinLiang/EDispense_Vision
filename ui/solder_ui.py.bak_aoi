@@ -24,12 +24,8 @@ from PyQt5.QtGui import QImage, QPixmap, QFont, QFontDatabase
 # 路径配置
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TINNING_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'tinning_640_640.rknn')
-AOI_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'aoi_640_640.rknn')
-# 兼容旧变量名：点锡模型
-MODEL_PATH = TINNING_MODEL_PATH
+MODEL_PATH = os.path.join(BASE_DIR, 'models', 'material-640-640-v5n.rknn')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
-AOI_IMAGE_DIR = '/run/media/mmcblk1p1/AOI_Picture'
 sys.path.insert(0, os.path.join(BASE_DIR, 'vision'))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -55,94 +51,6 @@ def S(base_val):
 # ============================================================
 # iOS风格 Stepper 控件
 # ============================================================
-
-
-
-class PinchZoomLabel(QLabel):
-    """支持双指缩放和拖动的图像Label（使用QPinchGesture）"""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.grabGesture(Qt.PinchGesture)
-        self._zoom = 1.0
-        self._min_zoom = 1.0
-        self._max_zoom = 5.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
-        self._original_pixmap = None
-
-    def setDisplayPixmap(self, pixmap):
-        """供外部调用：存储原始pixmap并应用当前缩放"""
-        self._original_pixmap = pixmap
-        self._apply_transform()
-
-    def reset_zoom(self):
-        self._zoom = 1.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
-        if self._original_pixmap:
-            self._apply_transform()
-
-    def _apply_transform(self):
-        if not self._original_pixmap:
-            return
-        pm = self._original_pixmap
-        label_w = self.width() or pm.width()
-        label_h = self.height() or pm.height()
-
-        if self._zoom <= 1.0:
-            # 正常显示，fitInView
-            scaled = pm.scaled(label_w, label_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            super().setPixmap(scaled)
-            self._pan_x = 0.0
-            self._pan_y = 0.0
-            return
-
-        # 放大：先缩放到zoom倍
-        w = int(pm.width() * self._zoom)
-        h = int(pm.height() * self._zoom)
-        # 先fit到label再zoom
-        base_scale = min(label_w / pm.width(), label_h / pm.height())
-        w = int(pm.width() * base_scale * self._zoom)
-        h = int(pm.height() * base_scale * self._zoom)
-        scaled = pm.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-        # 裁剪到label尺寸
-        cx = w / 2 - self._pan_x
-        cy = h / 2 - self._pan_y
-        x = int(max(0, min(cx - label_w / 2, w - label_w)))
-        y = int(max(0, min(cy - label_h / 2, h - label_h)))
-        crop_w = min(label_w, w)
-        crop_h = min(label_h, h)
-        cropped = scaled.copy(x, y, crop_w, crop_h)
-        super().setPixmap(cropped)
-
-    def event(self, ev):
-        if ev.type() == ev.Gesture:
-            return self._gesture_event(ev)
-        return super().event(ev)
-
-    def _gesture_event(self, ev):
-        pinch = ev.gesture(Qt.PinchGesture)
-        if pinch:
-            if pinch.state() == Qt.GestureUpdated:
-                scale_factor = pinch.scaleFactor()
-                self._zoom = max(self._min_zoom, min(self._max_zoom, self._zoom * scale_factor))
-                # 平移
-                delta = pinch.centerPoint() - pinch.lastCenterPoint()
-                self._pan_x += delta.x()
-                self._pan_y += delta.y()
-                self._apply_transform()
-            elif pinch.state() == Qt.GestureFinished:
-                if self._zoom < 1.05:
-                    self._zoom = 1.0
-                    self._pan_x = 0.0
-                    self._pan_y = 0.0
-                    self._apply_transform()
-            ev.accept()
-            return True
-        return False
-
-
 class IOSStepper(QWidget):
     """iOS风格 [▼] value [▲] 控件，全scale自适应"""
     valueChanged = pyqtSignal(float)
@@ -326,13 +234,10 @@ class MainWindow(QMainWindow):
         self.current_frame = None
         self.current_detections = None
         self.path_result = None
-        self.loaded_aoi_image = None
-        self.loaded_aoi_path = None
         self._frozen = False
 
         self._build_ui()
         self._apply_style()
-        self._update_mode_controls()
 
         # wmctrl强制全屏（兼容GNOME）
         QTimer.singleShot(500, self._force_fullscreen)
@@ -378,7 +283,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(mode_bar)
 
         # 视频显示区
-        self.video_label = PinchZoomLabel("点击 [开始] 启动摄像头")
+        self.video_label = QLabel("点击 [开始] 启动摄像头")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(S(400), S(300))
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
@@ -417,9 +322,7 @@ class MainWindow(QMainWindow):
 
         btn_row1 = QHBoxLayout()
         self.btn_start = QPushButton("► 开始")
-        self.btn_start.setFixedHeight(S(42))
         self.btn_stop = QPushButton("■ 停止")
-        self.btn_stop.setFixedHeight(S(42))
         self.btn_stop.setEnabled(False)
         btn_row1.addWidget(self.btn_start)
         btn_row1.addWidget(self.btn_stop)
@@ -427,15 +330,12 @@ class MainWindow(QMainWindow):
 
         btn_row2 = QHBoxLayout()
         self.btn_capture = QPushButton("◎ 路径生成")
-        self.btn_capture.setFixedHeight(S(42))
         self.btn_load = QPushButton("⊞ 加载图片")
-        self.btn_load.setFixedHeight(S(42))
         btn_row2.addWidget(self.btn_capture)
         btn_row2.addWidget(self.btn_load)
         ctrl_layout.addLayout(btn_row2)
 
         self.btn_execute = QPushButton("⚡ 执行点锡")
-        self.btn_execute.setFixedHeight(S(42))
         self.btn_execute.setEnabled(False)
         ctrl_layout.addWidget(self.btn_execute)
 
@@ -489,10 +389,6 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.log_text.viewport().setAttribute(Qt.WA_AcceptTouchEvents, True)
-        from PyQt5.QtWidgets import QScroller
-        QScroller.grabGesture(self.log_text.viewport(), QScroller.TouchGesture)
         log_layout.addWidget(self.log_text)
         right_layout.addWidget(log_group, 1)
 
@@ -503,7 +399,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_camera)
         self.btn_capture.clicked.connect(self.capture_frame)
         self.btn_load.clicked.connect(self.load_image)
-        self.btn_execute.clicked.connect(self.execute_action)
+        self.btn_execute.clicked.connect(self.execute_solder)
 
     # ----------------------------------------------------------
     # 样式
@@ -533,7 +429,7 @@ class MainWindow(QMainWindow):
             QPushButton {{
                 background: #ffffff; color: #1c1c1e; border: 1px solid #d1d1d6;
                 border-radius: {rad_sm}px; padding: {pad_sm}px {pad_md}px;
-                font-size: {fs_lg}px; font-weight: 500;
+                font-size: {fs_md}px; font-weight: 500;
             }}
             QPushButton:pressed {{ background: #e5e5ea; }}
             QPushButton:checked {{ background: #007aff; color: white; border: none; }}
@@ -572,7 +468,7 @@ class MainWindow(QMainWindow):
             QPushButton {{
                 background: #007aff; color: white; border: none;
                 border-radius: {rad_sm}px; padding: {S(6)}px;
-                font-size: {fs_lg}px; font-weight: 600;
+                font-size: {fs_md}px; font-weight: 600;
             }}
             QPushButton:pressed {{ background: #0051d5; }}
             QPushButton:disabled {{ background: #a2c4f5; color: #e8e8e8; }}
@@ -589,78 +485,15 @@ class MainWindow(QMainWindow):
             self.log_text.append(f"[{ts}] {msg}")
 
     def switch_mode(self, mode):
-        if mode == self.current_mode:
-            return
-        # 两种模式使用不同RKNN模型，切换时停止实时线程，避免模型错用
-        if self.infer_thread and self.infer_thread.isRunning():
-            self.stop_camera()
         self.current_mode = mode
         self.btn_solder.setChecked(mode == "solder")
         self.btn_aoi.setChecked(mode == "aoi")
-        self.current_detections = None
-        self.path_result = None
-        self._update_mode_controls()
         if mode == "solder":
+            self.btn_execute.setText("⚡ 执行点锡")
             self.log("⚙ 切换到 点锡模式")
         else:
+            self.btn_execute.setText("🔍 执行AOI检测")
             self.log("⚙ 切换到 AOI检测模式")
-            self._ensure_aoi_dir()
-
-    def _update_mode_controls(self):
-        is_solder = self.current_mode == "solder"
-        self.btn_capture.setText("◎ 路径生成" if is_solder else "◎ 锁定当前帧")
-        self.btn_capture.setEnabled(True)
-        self.btn_load.setEnabled(not is_solder)
-        self.btn_execute.setText("⚡ 执行点锡" if is_solder else "🔍 执行AOI检测")
-        self.btn_execute.setEnabled(False)
-        if is_solder:
-            self.lbl_path.setText("路径: -- 点")
-        else:
-            self.lbl_path.setText("AOI: --")
-
-    def _ensure_aoi_dir(self):
-        candidates = [
-            AOI_IMAGE_DIR,
-            os.path.join(BASE_DIR, 'AOI_Picture'),
-        ]
-        for path in candidates:
-            try:
-                os.makedirs(path, exist_ok=True)
-                if os.access(path, os.R_OK | os.W_OK):
-                    return path
-            except Exception:
-                continue
-        return BASE_DIR
-
-    def _lock_current_frame(self):
-        """AOI模式：锁定当前检测后画面（带标注），关闭摄像头，复位按钮"""
-        if self.current_frame is None:
-            self.log("⚠ 无画面可锁定，请先启动摄像头")
-            return
-        # 用当前帧+检测结果生成带标注的画面
-        frame = self.current_frame.copy()
-        if self.current_detections:
-            frame = self._draw_detections(frame, self.current_detections, color=(0, 0, 255), prefix="NG")
-        self.loaded_aoi_image = frame
-        self.loaded_aoi_path = "锁定帧"
-        # 停止摄像头
-        if self.infer_thread and self.infer_thread.isRunning():
-            self.infer_thread.stop()
-            self.infer_thread.wait()
-            self.infer_thread = None
-        # 复位开始/停止按钮
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        # 冻结显示带标注的画面
-        self._frozen = True
-        self.display_frame(frame)
-        n = len(self.current_detections) if self.current_detections else 0
-        self.lbl_path.setText(f"AOI: 已锁定 ({n}个缺陷)")
-        self.lbl_det.setText(f"缺陷: {n} 个")
-        self.log(f"◎ 已锁定当前检测画面({n}个缺陷)，摄像头已关闭")
-
-    def _current_model_path(self):
-        return TINNING_MODEL_PATH if self.current_mode == "solder" else AOI_MODEL_PATH
 
     def start_camera(self):
         cam_id = int(self.combo_cam.currentText().replace("✓", "").strip())
@@ -672,7 +505,7 @@ class MainWindow(QMainWindow):
             return
         _test.release()
         # 验证通过，启动推理线程
-        self.infer_thread = InferenceThread(self._current_model_path())
+        self.infer_thread = InferenceThread(MODEL_PATH)
         self.infer_thread.result_ready.connect(self.on_result)
         self.infer_thread.set_camera(cam_id)
         self.infer_thread.start()
@@ -696,10 +529,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
 
     def capture_frame(self):
-        """点锡模式：生成路径；AOI模式：锁定当前帧"""
-        if self.current_mode != "solder":
-            self._lock_current_frame()
-            return
+        """路径生成: 用当前实时检测结果直接生成路径"""
         frame = self.current_frame.copy() if self.current_frame is not None else None
         detections = list(self.current_detections) if self.current_detections else []
 
@@ -739,98 +569,16 @@ class MainWindow(QMainWindow):
             self.btn_stop.setEnabled(False)
 
     def load_image(self):
-        if self.current_mode != "aoi":
-            self.log("⚠ 加载图片仅在AOI检测模式可用")
-            return
         from PyQt5.QtWidgets import QFileDialog
-        aoi_dir = self._ensure_aoi_dir()
-        path, _ = QFileDialog.getOpenFileName(self, "选择AOI图片", aoi_dir, "Images (*.jpg *.png *.bmp)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.jpg *.png *.bmp)")
         if path:
             img = cv2.imread(path)
             if img is not None:
-                self.loaded_aoi_image = img
-                self.loaded_aoi_path = path
                 self.current_frame = img
                 self.display_frame(img)
-                self.lbl_path.setText("AOI: 已载入图片")
-                self.btn_execute.setEnabled(True)
-                self.log(f"⚙ 已加载AOI图片: {os.path.basename(path)}")
-            else:
-                self.log(f"✗ 图片读取失败: {path}")
-
-    def execute_action(self):
-        if self.current_mode == "solder":
-            self.execute_solder()
-        else:
-            self.execute_aoi()
-
-    def _infer_once(self, frame, model_path):
-        from rknnlite.api import RKNNLite
-        from infer import letterbox, process_output, INPUT_SIZE
-        rknn = RKNNLite()
-        rknn.load_rknn(model_path)
-        rknn.init_runtime()
-        t0 = time.time()
-        img_lb, r, pad = letterbox(frame, (INPUT_SIZE, INPUT_SIZE))
-        img_in = np.expand_dims(img_lb, axis=0)
-        outputs = rknn.inference(inputs=[img_in])
-        bboxes, scores, class_ids = process_output(outputs, frame.shape[:2], r, pad)
-        try:
-            rknn.release()
-        except Exception:
-            pass
-        elapsed = (time.time() - t0) * 1000
-        return list(zip(bboxes, scores, class_ids)) if len(bboxes) > 0 else [], elapsed
-
-    def _draw_detections(self, frame, detections, color=(0, 0, 255), prefix="DEFECT"):
-        vis = frame.copy()
-        for bbox, score, cls_id in detections:
-            x1, y1, x2, y2 = map(int, bbox)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = f"{prefix}{int(cls_id)} {score:.2f}"
-            cv2.putText(vis, label, (x1, max(15, y1 - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        return vis
-
-    def execute_aoi(self):
-        frame = None
-        source = ""
-        if self.loaded_aoi_image is not None:
-            frame = self.loaded_aoi_image.copy()
-            source = os.path.basename(self.loaded_aoi_path or "导入图片")
-        elif self.current_frame is not None:
-            frame = self.current_frame.copy()
-            source = "当前摄像头最后一帧"
-        if frame is None:
-            self.log("⚠ 无AOI输入：请先启动摄像头或加载图片")
-            return
-        # 冻结当前显示，避免实时线程覆盖AOI结果
-        self._frozen = True
-        if self.infer_thread and self.infer_thread.isRunning():
-            self.stop_camera()
-        try:
-            detections, elapsed = self._infer_once(frame, AOI_MODEL_PATH)
-            vis = self._draw_detections(frame, detections, color=(0, 0, 255), prefix="NG")
-            out_path = os.path.join(OUTPUT_DIR, 'aoi_result.jpg')
-            cv2.imwrite(out_path, vis)
-            self.current_frame = frame
-            self.current_detections = detections
-            self.display_frame(vis)
-            self.lbl_fps.setText(f"AOI: {elapsed:.1f} ms")
-            self.lbl_det.setText(f"缺陷: {len(detections)} 个")
-            self.lbl_path.setText("AOI: 完成")
-            self.log(f"✓ AOI检测完成({source}): {len(detections)}个缺陷")
-        except Exception as e:
-            self.log(f"✗ AOI检测出错: {e}")
-        finally:
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self.btn_execute.setEnabled(True)
+                self.log(f"⚙ 已加载: {os.path.basename(path)}")
 
     def execute_solder(self):
-        if self.current_mode != "solder":
-            self.execute_aoi()
-            return
         if not self.path_result or not self.path_result.get('points'):
             self.log("⚠ 当前无可用路径，请先点击「路径生成」")
             return
@@ -867,12 +615,13 @@ class MainWindow(QMainWindow):
         self.lbl_fps.setText(f"推理: {elapsed:.1f} ms")
         self.lbl_det.setText(f"检测: {len(detections)} 个目标")
 
-        # 画检测框：点锡绿色焊盘，AOI红色缺陷
-        if self.current_mode == "aoi":
-            vis = self._draw_detections(frame, detections, color=(0, 0, 255), prefix="NG")
-            self.lbl_det.setText(f"缺陷: {len(detections)} 个")
-        else:
-            vis = self._draw_detections(frame, detections, color=(0, 255, 0), prefix="PAD")
+        # 画检测框
+        vis = frame.copy()
+        for bbox, score, cls_id in detections:
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(vis, f"{score:.2f}", (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         self.display_frame(vis)
 
@@ -884,7 +633,7 @@ class MainWindow(QMainWindow):
 
         label_size = self.video_label.size()
         pixmap = QPixmap.fromImage(qimg).scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.video_label.setDisplayPixmap(pixmap)
+        self.video_label.setPixmap(pixmap)
 
 
     def _scan_cameras(self):
