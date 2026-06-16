@@ -1,33 +1,89 @@
+#!/usr/bin/env python3
+"""
+RKNN YOLOv5 推理模块
+===================
+功能: 在 RK3588 NPU 上运行 YOLOv5n 模型，用于焊盘检测(点锡模式)或缺陷检测(AOI模式)。
+
+流程:
+    1. letterbox() - 将原图缩放+补灰边到 640x640 保持宽高比
+    2. RKNN推理 - 输入640x640 uint8图像，输出检测张量
+    3. process_output() - 解码YOLO输出，执行NMS，将坐标映射回原图
+
+支持两种RKNN输出格式:
+    - 单输出: [1, N, 5+C] 格式 (已后处理的)
+    - 三头输出: (1,24,80,80), (1,24,40,40), (1,24,20,20) (需手动解码anchor)
+
+依赖: rknnlite (RK3588 NPU SDK), OpenCV, NumPy
+"""
 
 import cv2
 import numpy as np
 from rknnlite.api import RKNNLite
 import time
 
-MODEL_PATH = '/home/elf/yolo/material-640-640-v5n.rknn'
-IMG_PATH = '/home/elf/yolo/1.jpg'
-OUTPUT_PATH = '/home/elf/yolo/result.jpg'
+# ============================================================
+# 全局配置常量
+# ============================================================
+MODEL_PATH = '/home/elf/yolo/material-640-640-v5n.rknn'  # 默认模型路径(实际由UI动态指定)
+IMG_PATH = '/home/elf/yolo/1.jpg'      # 测试用图片路径
+OUTPUT_PATH = '/home/elf/yolo/result.jpg'  # 测试用输出路径
 
-CONF_THRESH = 0.25
-NMS_THRESH = 0.45
-INPUT_SIZE = 640
+CONF_THRESH = 0.25   # 置信度阈值: objectness * class_prob > 此值才保留
+NMS_THRESH = 0.45    # NMS IoU阈值: 重叠超过此值的框被抑制
+INPUT_SIZE = 640     # 模型输入尺寸 (正方形)
+
 
 def letterbox(img, new_shape=(640, 640)):
-    shape = img.shape[:2]
+    """
+    Letterbox缩放: 等比缩放图像并用灰色(114)补边到目标尺寸。
+    
+    Args:
+        img: 原始BGR图像 (H, W, 3)
+        new_shape: 目标尺寸 (height, width)，默认 (640, 640)
+    
+    Returns:
+        img: 缩放补边后的图像 (new_shape[0], new_shape[1], 3)
+        r: 缩放比例 (float)，用于坐标反算
+        (dw, dh): 左/上补边像素数 (float)，用于坐标反算
+    """
+    shape = img.shape[:2]  # 原图 [H, W]
+    # 计算缩放比例(取较小值保证图像完全在目标内)
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    # 缩放后的实际尺寸(未补边)
     new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+    # 需要补边的像素数(左右/上下各一半)
     dw = (new_shape[1] - new_unpad[0]) / 2
     dh = (new_shape[0] - new_unpad[1]) / 2
+    # 缩放
     img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    # 补灰边
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
     return img, r, (dw, dh)
 
+
 def sigmoid(x):
+    """Sigmoid激活函数，用于将原始logit转为概率值"""
     return 1 / (1 + np.exp(-x))
 
+
 def process_output(outputs, img_shape, r, pad):
+    """
+    解码RKNN模型输出并执行NMS，返回原图坐标的检测结果。
+    
+    Args:
+        outputs: RKNN推理输出列表，支持单头或三头格式
+        img_shape: 原图尺寸 (H, W)，用于坐标边界裁剪
+        r: letterbox缩放比例
+        pad: (dw, dh) letterbox补边偏移
+    
+    Returns:
+        bboxes: numpy array [N, 4] 格式 [x1, y1, x2, y2] 原图像素坐标
+        scores: numpy array [N] 置信度分数
+        class_ids: numpy array [N] 类别ID
+        若无检测结果返回 ([], [], [])
+    """
     print(f"Number of outputs: {len(outputs)}")
     for i, out in enumerate(outputs):
         print(f"  Output[{i}]: shape={out.shape}, dtype={out.dtype}, min={out.min():.3f}, max={out.max():.3f}")

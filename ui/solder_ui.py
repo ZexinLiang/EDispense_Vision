@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 """
-智能点锡与AOI检测系统 - RK3588版 (v2 全Scale自适应重构)
+智能点锡与AOI检测系统 - RK3588版
+==================================
+硬件平台: 飞凌ELF2 (RK3588), HDMI触摸屏, USB摄像头, STM32执行系统
+软件框架: PyQt5 + RKNNLite (NPU加速YOLOv5n)
 
-设计基准: 1024x600
-Scale策略: 所有像素值 = base * scale, scale = screen_width / 1024
+功能模块:
+    - 点锡模式: 实时检测焊盘 → 选中/编辑 → 路径规划 → G-code执行
+    - AOI模式: 摄像头/图片输入 → 缺陷检测 → 红框标注显示
+    - 执行系统: USB CDC心跳检测STM32在线状态
+
+UI设计:
+    - 设计基准: 1024x600, 全屏自适应缩放 (scale = screen_width / 1024)
+    - 左侧: 视频/图像显示区(支持双指缩放) + 状态栏
+    - 右侧: 模式切换 + 控制按钮 + 参数面板 + 日志区
+
+采集流程 (点锡模式):
+    1920x1080 MJPG采集 → 中心裁剪1080x1080 → 缩放640x640送NPU →
+    检测坐标映射回原图 → 显示中心1640x1080区域(带标注)
+
+作者: 梁泽欣
 """
 import sys
 import os
@@ -18,7 +34,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QLineEdit, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
-from PyQt5.QtGui import QImage, QPixmap, QFont, QFontDatabase
+from PyQt5.QtGui import QPainter, QPainterPath, QImage, QPixmap, QFont, QFontDatabase
 
 # ============================================================
 # 路径配置
@@ -61,8 +77,10 @@ def S(base_val):
 class PinchZoomLabel(QLabel):
     """支持双指缩放和拖动的图像Label（使用QPinchGesture）"""
     def __init__(self, *args, **kwargs):
+        """初始化PinchZoomLabel：启用手势识别，设置缩放/平移参数"""
         super().__init__(*args, **kwargs)
         self.grabGesture(Qt.PinchGesture)
+        self._current_display = None
         self._zoom = 1.0
         self._min_zoom = 1.0
         self._max_zoom = 5.0
@@ -72,19 +90,59 @@ class PinchZoomLabel(QLabel):
         self._gesture_active = False
         self._press_pos = None
 
+
+    def _setRoundedPixmap(self, pixmap):
+        """设置圆角裁剪的pixmap"""
+        from PyQt5.QtGui import QPainter, QPainterPath, QPixmap
+        from PyQt5.QtCore import QRectF
+        radius = 14 * (self.width() / 1024) if self.width() > 0 else 14
+        rounded = QPixmap(pixmap.size())
+        rounded.fill(Qt.transparent)
+        painter = QPainter(rounded)
+        painter.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rounded.rect()), radius, radius)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        self._setRoundedPixmap(rounded)
+
     def setDisplayPixmap(self, pixmap):
         """供外部调用：存储原始pixmap并应用当前缩放"""
         self._original_pixmap = pixmap
         self._apply_transform()
 
     def reset_zoom(self):
+        """重置缩放和平移到初始状态(1x, 无偏移)"""
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
         if self._original_pixmap:
             self._apply_transform()
 
+
+    def paintEvent(self, event):
+        """重写paintEvent: 使用QPainterPath实现圆角裁剪显示图像"""
+        if self._current_display:
+            from PyQt5.QtGui import QPainter, QPainterPath
+            from PyQt5.QtCore import QRectF
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            radius = 14.0 * self.width() / 1024.0
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect()), radius, radius)
+            painter.setClipPath(path)
+            # 居中绘制pixmap
+            pm = self._current_display
+            x = (self.width() - pm.width()) // 2
+            y = (self.height() - pm.height()) // 2
+            painter.drawPixmap(x, y, pm)
+            painter.end()
+        else:
+            super().paintEvent(event)
+
     def _apply_transform(self):
+        """根据当前zoom/pan计算裁剪区域，生成_current_display并触发重绘"""
         if not self._original_pixmap:
             return
         pm = self._original_pixmap
@@ -94,7 +152,8 @@ class PinchZoomLabel(QLabel):
         if self._zoom <= 1.0:
             # 正常显示，fitInView
             scaled = pm.scaled(label_w, label_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            super().setPixmap(scaled)
+            self._current_display = scaled
+            self.update()
             self._pan_x = 0.0
             self._pan_y = 0.0
             return
@@ -116,7 +175,8 @@ class PinchZoomLabel(QLabel):
         crop_w = min(label_w, w)
         crop_h = min(label_h, h)
         cropped = scaled.copy(x, y, crop_w, crop_h)
-        super().setPixmap(cropped)
+        self._current_display = cropped
+        self.update()
 
     def mousePressEvent(self, ev):
         """记录按下位置，松手时判定是否为有效点击"""
@@ -135,35 +195,62 @@ class PinchZoomLabel(QLabel):
             if (dx * dx + dy * dy) < 225:  # 15px以内算点击
                 pm = self._original_pixmap
                 label_w, label_h = self.width(), self.height()
-                base_scale = min(label_w / pm.width(), label_h / pm.height()) * self._zoom
-                img_w = pm.width() * base_scale
-                img_h = pm.height() * base_scale
-                off_x = (label_w - min(img_w, label_w)) / 2
-                off_y = (label_h - min(img_h, label_h)) / 2
+                base_scale = min(label_w / pm.width(), label_h / pm.height())
+
                 if self._zoom <= 1.0:
-                    x_ratio = (ev.x() - off_x) / img_w if img_w > 0 else 0
-                    y_ratio = (ev.y() - off_y) / img_h if img_h > 0 else 0
+                    # 未放大：_current_display = fitInView scaled
+                    disp = self._current_display
+                    if disp:
+                        off_x = (label_w - disp.width()) // 2
+                        off_y = (label_h - disp.height()) // 2
+                        px = ev.x() - off_x
+                        py = ev.y() - off_y
+                        if 0 <= px < disp.width() and 0 <= py < disp.height():
+                            x_ratio = px / disp.width()
+                            y_ratio = py / disp.height()
+                        else:
+                            x_ratio = y_ratio = -1
+                    else:
+                        x_ratio = y_ratio = -1
                 else:
-                    cx = img_w / 2 - self._pan_x
-                    cy = img_h / 2 - self._pan_y
-                    view_x = max(0, cx - label_w / 2)
-                    view_y = max(0, cy - label_h / 2)
-                    x_ratio = (ev.x() + view_x) / img_w if img_w > 0 else 0
-                    y_ratio = (ev.y() + view_y) / img_h if img_h > 0 else 0
-                x_ratio = max(0.0, min(1.0, x_ratio))
-                y_ratio = max(0.0, min(1.0, y_ratio))
-                main_win = self.window()
-                if hasattr(main_win, '_on_image_clicked'):
-                    main_win._on_image_clicked(x_ratio, y_ratio)
+                    # 放大：需要反算到原图坐标
+                    # scaled尺寸
+                    sw = int(pm.width() * base_scale * self._zoom)
+                    sh = int(pm.height() * base_scale * self._zoom)
+                    # 裁剪起点(跟_apply_transform一致)
+                    cx = sw / 2 - self._pan_x
+                    cy = sh / 2 - self._pan_y
+                    crop_x = int(max(0, min(cx - label_w / 2, sw - label_w)))
+                    crop_y = int(max(0, min(cy - label_h / 2, sh - label_h)))
+                    # _current_display居中绘制的偏移
+                    disp = self._current_display
+                    if disp:
+                        off_x = (label_w - disp.width()) // 2
+                        off_y = (label_h - disp.height()) // 2
+                    else:
+                        off_x = off_y = 0
+                    # 点击在scaled pixmap上的坐标
+                    sx = ev.x() - off_x + crop_x
+                    sy = ev.y() - off_y + crop_y
+                    # 映射到原图比例
+                    x_ratio = sx / sw if sw > 0 else 0
+                    y_ratio = sy / sh if sh > 0 else 0
+
+                if 0 <= x_ratio <= 1 and 0 <= y_ratio <= 1:
+                    main_win = self.window()
+                    if hasattr(main_win, '_on_image_clicked'):
+                        main_win._on_image_clicked(x_ratio, y_ratio)
         self._press_pos = None
         super().mouseReleaseEvent(ev)
 
     def event(self, ev):
+        """事件分发：拦截手势事件交给_gesture_event处理"""
         if ev.type() == ev.Gesture:
             return self._gesture_event(ev)
         return super().event(ev)
 
     def _gesture_event(self, ev):
+        """处理QPinchGesture：更新缩放比例和平移偏移"""
         self._gesture_active = True
         pinch = ev.gesture(Qt.PinchGesture)
         if pinch:
@@ -191,6 +278,7 @@ class IOSStepper(QWidget):
     valueChanged = pyqtSignal(float)
 
     def __init__(self, min_val=0, max_val=100, value=50, step=1, decimals=0, parent=None):
+        """初始化iOS风格步进器控件：[▼] 数值 [▲] 布局"""
         super().__init__(parent)
         self._min = min_val
         self._max = max_val
@@ -247,22 +335,26 @@ class IOSStepper(QWidget):
         self._update_display()
 
     def _update_display(self):
+        """更新中间数值显示文本"""
         if self._decimals == 0:
             self.edit_value.setText(str(int(self._value)))
         else:
             self.edit_value.setText(f"{self._value:.{self._decimals}f}")
 
     def _inc(self):
+        """步进器加一步"""
         self._value = min(self._max, self._value + self._step)
         self._update_display()
         self.valueChanged.emit(self._value)
 
     def _dec(self):
+        """步进器减一步"""
         self._value = max(self._min, self._value - self._step)
         self._update_display()
         self.valueChanged.emit(self._value)
 
     def _on_edit(self):
+        """手动编辑数值后的回调：解析输入并约束范围"""
         try:
             v = float(self.edit_value.text())
             self._value = max(self._min, min(self._max, v))
@@ -272,9 +364,11 @@ class IOSStepper(QWidget):
         self.valueChanged.emit(self._value)
 
     def value(self):
+        """获取当前步进器值"""
         return self._value
 
     def setValue(self, v):
+        """设置步进器值(自动约束范围)"""
         self._value = max(self._min, min(self._max, v))
         self._update_display()
 
@@ -287,6 +381,7 @@ class InferenceThread(QThread):
     result_ready = pyqtSignal(object, list, float)  # frame, detections, elapsed_ms
 
     def __init__(self, model_path):
+        """初始化推理线程：指定RKNN模型路径"""
         super().__init__()
         self.model_path = model_path
         self.running = False
@@ -295,12 +390,14 @@ class InferenceThread(QThread):
         self.mode = 'camera'
 
     def init_model(self):
+        """加载RKNN模型到NPU"""
         from rknnlite.api import RKNNLite
         self.rknn = RKNNLite()
         self.rknn.load_rknn(self.model_path)
         self.rknn.init_runtime()
 
     def set_camera(self, cam_id):
+        """设置摄像头输入源：打开设备并配置1920x1080 MJPG 30fps"""
         self.cap = cv2.VideoCapture(cam_id)
         # 设置MJPG编码 + 1920x1080全高清采集
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -310,10 +407,12 @@ class InferenceThread(QThread):
         self.mode = 'camera'
 
     def set_image(self, img):
+        """设置单张图片输入源(用于AOI加载图片模式)"""
         self._img = img
         self.mode = 'image'
 
     def run(self):
+        """推理线程主循环：读帧→裁剪中心1080x1080→letterbox→NPU推理→坐标映射→emit结果"""
         from infer import letterbox, process_output, CONF_THRESH, NMS_THRESH, INPUT_SIZE
         self.running = True
         if self.rknn is None:
@@ -331,15 +430,37 @@ class InferenceThread(QThread):
                 time.sleep(0.01)
                 continue
 
+            h, w = frame.shape[:2]
+            # 裁剪中心1080x1080用于模型推理
+            crop_size = min(h, w)  # 1080 for 1920x1080
+            cx, cy = w // 2, h // 2
+            x1_crop = cx - crop_size // 2
+            y1_crop = cy - crop_size // 2
+            infer_crop = frame[y1_crop:y1_crop+crop_size, x1_crop:x1_crop+crop_size]
+
             t0 = time.time()
-            img_lb, r, pad = letterbox(frame, (INPUT_SIZE, INPUT_SIZE))
+            img_lb, r, pad = letterbox(infer_crop, (INPUT_SIZE, INPUT_SIZE))
             img_in = np.expand_dims(img_lb, axis=0)
             outputs = self.rknn.inference(inputs=[img_in])
-            bboxes, scores, class_ids = process_output(outputs, frame.shape[:2], r, pad)
+            bboxes, scores, class_ids = process_output(outputs, infer_crop.shape[:2], r, pad)
             elapsed = (time.time() - t0) * 1000
 
+            # 检测坐标从crop坐标系映射回原图坐标系
+            if len(bboxes) > 0:
+                bboxes[:, [0, 2]] += x1_crop
+                bboxes[:, [1, 3]] += y1_crop
+
+            # 裁剪中心1640x1080用于显示(保留更多上下文)
+            disp_w = min(1640, w)
+            x1_disp = cx - disp_w // 2
+            display_frame = frame[0:h, x1_disp:x1_disp+disp_w].copy()
+
+            # 检测坐标映射到display_frame坐标系
+            if len(bboxes) > 0:
+                bboxes[:, [0, 2]] -= x1_disp
+
             detections = list(zip(bboxes, scores, class_ids)) if len(bboxes) > 0 else []
-            self.result_ready.emit(frame, detections, elapsed)
+            self.result_ready.emit(display_frame, detections, elapsed)
 
             if self.mode == 'image':
                 self.running = False
@@ -347,6 +468,7 @@ class InferenceThread(QThread):
             time.sleep(0.01)
 
     def stop(self):
+        """停止推理线程并释放摄像头资源"""
         self.running = False
         if self.cap:
             self.cap.release()
@@ -357,7 +479,9 @@ class InferenceThread(QThread):
 # 主窗口
 # ============================================================
 class MainWindow(QMainWindow):
+    """主窗口：智能点锡与AOI检测系统的核心UI，管理所有交互逻辑和子模块"""
     def __init__(self):
+        """初始化主窗口：创建UI/信号连接/心跳定时器/状态变量"""
         super().__init__()
         self.setWindowTitle("智能点锡与AOI检测系统 - RK3588")
 
@@ -365,6 +489,14 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen().geometry()
         self.setFixedSize(screen.width(), screen.height())
         self.showFullScreen()
+
+        # 运动系统心跳检测
+        self._motor_online = False
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.timeout.connect(self._heartbeat_check)
+        self._heartbeat_timer.start(10000)  # 60s
+        # 启动时立刻检测一次
+        QTimer.singleShot(3000, self._heartbeat_check)
 
         self._scale = screen.width() / 1024.0
 
@@ -386,6 +518,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._force_fullscreen)
 
     def _force_fullscreen(self):
+        """延迟强制全屏(部分窗管首次不响应showFullScreen)"""
         try:
             subprocess.run(['wmctrl', '-r', ':ACTIVE:', '-b', 'add,fullscreen'], timeout=2,
                           capture_output=True)
@@ -396,6 +529,7 @@ class MainWindow(QMainWindow):
     # UI构建
     # ----------------------------------------------------------
     def _build_ui(self):
+        """构建完整UI布局：左侧视频+状态栏，右侧控制面板+参数+日志"""
         s = self._scale
         central = QWidget()
         self.setCentralWidget(central)
@@ -447,6 +581,9 @@ class MainWindow(QMainWindow):
         status_inner.addWidget(self.lbl_fps)
         status_inner.addWidget(self.lbl_det)
         status_inner.addWidget(self.lbl_path)
+        self.lbl_motor = QLabel("执行系统: --")
+        self.lbl_motor.setStyleSheet(f"color: #8e8e93; font-weight: 600;")
+        status_inner.addWidget(self.lbl_motor)
         left_layout.addWidget(status_widget)
 
         main_layout.addLayout(left_layout, 1)
@@ -500,6 +637,7 @@ class MainWindow(QMainWindow):
         param_layout.setSpacing(S(6))
 
         def make_row(label_text, widget):
+            """创建参数行布局：左侧标签+右侧控件"""
             row = QHBoxLayout()
             lbl = QLabel(label_text)
             lbl.setFixedWidth(S(80))
@@ -524,6 +662,7 @@ class MainWindow(QMainWindow):
         # 重写showPopup：弹出前扫描可用摄像头
         _orig_popup = self.combo_cam.showPopup
         def _custom_popup():
+            """自定义摄像头选择下拉框弹出前的扫描回调"""
             if self._scan_cameras() is not False:
                 _orig_popup()
         self.combo_cam.showPopup = _custom_popup
@@ -557,6 +696,7 @@ class MainWindow(QMainWindow):
     # 样式
     # ----------------------------------------------------------
     def _apply_style(self):
+        """应用iOS风格全局样式表：按钮/标签/进度条/日志区域"""
         s = self._scale
         fs_sm = S(10)
         fs_md = S(11)
@@ -630,13 +770,43 @@ class MainWindow(QMainWindow):
     # 业务逻辑
     # ----------------------------------------------------------
     def log(self, msg):
+        """向日志区域追加一条带时间戳的消息(⚠开头显示红色)"""
         ts = time.strftime('%H:%M:%S')
         if msg.startswith("⚠") or msg.startswith("✗"):
             self.log_text.append(f'<span style="color:#ff3b30">[{ts}] {msg}</span>')
         else:
             self.log_text.append(f"[{ts}] {msg}")
 
+    def _heartbeat_check(self):
+        """每10s调用独立脚本检测执行系统是否在线"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['python3', '/home/elf/solder_system/heartbeat_check.py'],
+                timeout=3, capture_output=True
+            )
+            if result.returncode == 0:
+                if not self._motor_online:
+                    self.log("✓ 执行系统已上线")
+                self._motor_online = True
+                self.lbl_motor.setText("执行系统: 在线")
+                self.lbl_motor.setStyleSheet("color: #34c759; font-weight: 600;")
+            else:
+                self._set_motor_offline()
+        except Exception:
+            self._set_motor_offline()
+
+    def _set_motor_offline(self):
+        """设置执行系统为离线状态"""
+        if self._motor_online:
+            self.log("⚠ 执行系统离线！")
+        self._motor_online = False
+        self.lbl_motor.setText("执行系统: 离线")
+        self.lbl_motor.setStyleSheet("color: #ff3b30; font-weight: 600;")
+
+
     def switch_mode(self, mode):
+        """切换工作模式：点锡(solder)↔AOI，停止当前推理并更新UI状态"""
         if mode == self.current_mode:
             return
         # 两种模式使用不同RKNN模型，切换时停止实时线程，避免模型错用
@@ -655,6 +825,7 @@ class MainWindow(QMainWindow):
             self._ensure_aoi_dir()
 
     def _update_mode_controls(self):
+        """根据当前模式更新按钮可用性和文字(点锡/AOI差异化)"""
         is_solder = self.current_mode == "solder"
         self.btn_capture.setText("◎ 路径生成" if is_solder else "◎ 锁定当前帧")
         self.btn_capture.setEnabled(True)
@@ -667,6 +838,7 @@ class MainWindow(QMainWindow):
             self.lbl_path.setText("AOI: --")
 
     def _ensure_aoi_dir(self):
+        """确保AOI图片存储目录可用：优先SD卡，fallback到本地"""
         candidates = [
             AOI_IMAGE_DIR,
             os.path.join(BASE_DIR, 'AOI_Picture'),
@@ -708,9 +880,11 @@ class MainWindow(QMainWindow):
         self.log(f"◎ 已锁定当前检测画面({n}个缺陷)，摄像头已关闭")
 
     def _current_model_path(self):
+        """根据当前模式返回对应的RKNN模型路径(点锡/AOI)"""
         return TINNING_MODEL_PATH if self.current_mode == "solder" else AOI_MODEL_PATH
 
     def start_camera(self):
+        """启动摄像头实时推理：验证设备→创建InferenceThread→开始"""
         cam_id = int(self.combo_cam.currentText().replace("✓", "").strip())
         # 先验证摄像头能否打开
         import cv2 as _cv2
@@ -735,6 +909,7 @@ class MainWindow(QMainWindow):
         self.log(f"✓ 摄像头 {cam_id} 已启动")
 
     def stop_camera(self):
+        """停止摄像头：冻结画面，点锡模式进入编辑选中状态"""
         self._frozen = True
 
         if self.infer_thread and self.infer_thread.isRunning():
@@ -845,6 +1020,7 @@ class MainWindow(QMainWindow):
             self.btn_stop.setEnabled(False)
 
     def load_image(self):
+        """AOI模式加载图片：打开文件对话框，显示图片到视频区"""
         if self.current_mode != "aoi":
             self.log("⚠ 加载图片仅在AOI检测模式可用")
             return
@@ -865,12 +1041,14 @@ class MainWindow(QMainWindow):
                 self.log(f"✗ 图片读取失败: {path}")
 
     def execute_action(self):
+        """执行按钮分发：根据当前模式调用execute_solder或execute_aoi"""
         if self.current_mode == "solder":
             self.execute_solder()
         else:
             self.execute_aoi()
 
     def _infer_once(self, frame, model_path):
+        """对单帧执行一次RKNN推理(阻塞)，返回(bboxes, scores, class_ids, elapsed_ms)"""
         from rknnlite.api import RKNNLite
         from infer import letterbox, process_output, INPUT_SIZE
         rknn = RKNNLite()
@@ -889,6 +1067,7 @@ class MainWindow(QMainWindow):
         return list(zip(bboxes, scores, class_ids)) if len(bboxes) > 0 else [], elapsed
 
     def _draw_detections(self, frame, detections, color=(0, 0, 255), prefix="DEFECT"):
+        """在帧上绘制检测框和标签，返回标注后的图像副本"""
         vis = frame.copy()
         for bbox, score, cls_id in detections:
             x1, y1, x2, y2 = map(int, bbox)
@@ -899,6 +1078,7 @@ class MainWindow(QMainWindow):
         return vis
 
     def execute_aoi(self):
+        """执行AOI检测：用当前帧或锁定帧推理，结果标注红框显示"""
         frame = None
         source = ""
         if self.loaded_aoi_image is not None:
@@ -934,6 +1114,7 @@ class MainWindow(QMainWindow):
             self.btn_execute.setEnabled(True)
 
     def execute_solder(self):
+        """执行点锡动作：将G-code通过串口发送到STM32(TODO)"""
         if self.current_mode != "solder":
             self.execute_aoi()
             return
@@ -955,6 +1136,7 @@ class MainWindow(QMainWindow):
         self.log(f"⚙ 开始执行点锡: {total} 点")
 
     def _exec_step(self):
+        """点锡执行进度回调：更新进度条，逐步发送G-code指令"""
         if self._exec_idx >= len(self._exec_points):
             self._exec_timer.stop()
             self.progress_bar.setValue(self.progress_bar.maximum())
@@ -966,6 +1148,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(self._exec_idx)
 
     def on_result(self, frame, detections, elapsed):
+        """推理结果回调(InferenceThread信号)：更新状态栏+绘制检测框+显示帧"""
         if self._frozen:
             return
         self.current_frame = frame
@@ -983,6 +1166,7 @@ class MainWindow(QMainWindow):
         self.display_frame(vis)
 
     def display_frame(self, frame):
+        """将OpenCV BGR帧转为QPixmap并显示到PinchZoomLabel(保持缩放状态)"""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -1021,6 +1205,7 @@ class MainWindow(QMainWindow):
                 break
 
     def closeEvent(self, event):
+        """窗口关闭事件：停止推理线程，释放资源"""
         self.stop_camera()
         event.accept()
 

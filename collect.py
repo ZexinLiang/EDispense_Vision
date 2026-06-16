@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-数据集采集脚本
-按Enter键采集一张图片，按数字编号存到datasheet文件夹
-按q退出
+数据集采集工具
+=============
+功能: 从USB摄像头实时预览画面，按键采集训练样本图片。
+用途: 为YOLOv5焊盘/缺陷检测模型收集训练数据。
+
+操作:
+    Enter - 保存当前帧为 XXXX.jpg (自动递增编号)
+    q     - 退出采集
+
+输出目录: /home/elf/solder_system/datasheet/
+图片格式: BGR JPG, 分辨率取决于摄像头默认设置
 """
 import cv2
 import os
