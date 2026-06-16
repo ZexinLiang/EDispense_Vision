@@ -87,6 +87,7 @@ class PinchZoomLabel(QLabel):
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._original_pixmap = None
+        self._gesture_in_progress = False  # 手势进行中用快速渲染
         self._gesture_active = False
         self._press_pos = None
 
@@ -151,7 +152,8 @@ class PinchZoomLabel(QLabel):
 
         if self._zoom <= 1.0:
             # 正常显示，fitInView
-            scaled = pm.scaled(label_w, label_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            _mode = Qt.FastTransformation if self._gesture_in_progress else Qt.SmoothTransformation
+            scaled = pm.scaled(label_w, label_h, Qt.KeepAspectRatio, _mode)
             self._current_display = scaled
             self.update()
             self._pan_x = 0.0
@@ -165,7 +167,8 @@ class PinchZoomLabel(QLabel):
         base_scale = min(label_w / pm.width(), label_h / pm.height())
         w = int(pm.width() * base_scale * self._zoom)
         h = int(pm.height() * base_scale * self._zoom)
-        scaled = pm.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        _mode = Qt.FastTransformation if self._gesture_in_progress else Qt.SmoothTransformation
+        scaled = pm.scaled(w, h, Qt.KeepAspectRatio, _mode)
 
         # 裁剪到label尺寸
         cx = w / 2 - self._pan_x
@@ -252,6 +255,7 @@ class PinchZoomLabel(QLabel):
     def _gesture_event(self, ev):
         """处理QPinchGesture：更新缩放比例和平移偏移"""
         self._gesture_active = True
+        self._gesture_in_progress = True
         pinch = ev.gesture(Qt.PinchGesture)
         if pinch:
             if pinch.state() == Qt.GestureUpdated:
