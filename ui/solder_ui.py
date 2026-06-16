@@ -152,7 +152,7 @@ class PinchZoomLabel(QLabel):
 
         if self._zoom <= 1.0:
             # 正常显示，fitInView
-            _mode = Qt.FastTransformation if self._gesture_in_progress else Qt.SmoothTransformation
+            _mode = Qt.FastTransformation
             scaled = pm.scaled(label_w, label_h, Qt.KeepAspectRatio, _mode)
             self._current_display = scaled
             self.update()
@@ -167,7 +167,7 @@ class PinchZoomLabel(QLabel):
         base_scale = min(label_w / pm.width(), label_h / pm.height())
         w = int(pm.width() * base_scale * self._zoom)
         h = int(pm.height() * base_scale * self._zoom)
-        _mode = Qt.FastTransformation if self._gesture_in_progress else Qt.SmoothTransformation
+        _mode = Qt.FastTransformation
         scaled = pm.scaled(w, h, Qt.KeepAspectRatio, _mode)
 
         # 裁剪到label尺寸
