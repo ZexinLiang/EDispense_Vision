@@ -109,7 +109,7 @@ class PinchZoomLabel(QLabel):
         self._setRoundedPixmap(rounded)
 
     def setDisplayPixmap(self, pixmap):
-        """供外部调用：存储原始pixmap并应用当前缩放"""
+        """供外部调用：存储原始pixmap并应用当前缩放(手势中跳过避免卡顿)"""
         self._original_pixmap = pixmap
         self._apply_transform()
 
@@ -152,7 +152,7 @@ class PinchZoomLabel(QLabel):
 
         if self._zoom <= 1.0:
             # 正常显示，fitInView
-            _mode = Qt.FastTransformation
+            _mode = Qt.SmoothTransformation
             scaled = pm.scaled(label_w, label_h, Qt.KeepAspectRatio, _mode)
             self._current_display = scaled
             self.update()
@@ -167,7 +167,7 @@ class PinchZoomLabel(QLabel):
         base_scale = min(label_w / pm.width(), label_h / pm.height())
         w = int(pm.width() * base_scale * self._zoom)
         h = int(pm.height() * base_scale * self._zoom)
-        _mode = Qt.FastTransformation
+        _mode = Qt.SmoothTransformation
         scaled = pm.scaled(w, h, Qt.KeepAspectRatio, _mode)
 
         # 裁剪到label尺寸
@@ -782,31 +782,32 @@ class MainWindow(QMainWindow):
             self.log_text.append(f"[{ts}] {msg}")
 
     def _heartbeat_check(self):
-        """每10s调用独立脚本检测执行系统是否在线"""
-        import subprocess
-        try:
-            result = subprocess.run(
-                ['python3', '/home/elf/solder_system/heartbeat_check.py'],
-                timeout=3, capture_output=True
-            )
-            if result.returncode == 0:
-                if not self._motor_online:
-                    self.log("✓ 执行系统已上线")
-                self._motor_online = True
-                self.lbl_motor.setText("执行系统: 在线")
-                self.lbl_motor.setStyleSheet("color: #34c759; font-weight: 600;")
-            else:
-                self._set_motor_offline()
-        except Exception:
-            self._set_motor_offline()
+        """每10s异步调用心跳脚本(QProcess非阻塞,不卡UI)"""
+        from PyQt5.QtCore import QProcess
+        if not hasattr(self, '_hb_process'):
+            self._hb_process = None
+        if self._hb_process and self._hb_process.state() != QProcess.NotRunning:
+            return
+        self._hb_process = QProcess(self)
+        self._hb_process.finished.connect(self._on_heartbeat_done)
+        self._hb_process.start('python3', ['/home/elf/solder_system/heartbeat_check.py'])
 
-    def _set_motor_offline(self):
-        """设置执行系统为离线状态"""
-        if self._motor_online:
-            self.log("⚠ 执行系统离线！")
-        self._motor_online = False
-        self.lbl_motor.setText("执行系统: 离线")
-        self.lbl_motor.setStyleSheet("color: #ff3b30; font-weight: 600;")
+    def _on_heartbeat_done(self, exit_code, exit_status):
+        """心跳结果回调(异步,不阻塞主线程)"""
+        was_online = self._motor_online
+        if exit_code == 0:
+            if not was_online:
+                self.log("✓ 执行系统已上线")
+            self._motor_online = True
+            self.lbl_motor.setText("执行系统: 在线")
+            self.lbl_motor.setStyleSheet("color: #34c759; font-weight: 600;")
+        else:
+            if was_online:
+                self.log("⚠ 执行系统离线！")
+            self._motor_online = False
+            self.lbl_motor.setText("执行系统: 离线")
+            self.lbl_motor.setStyleSheet("color: #ff3b30; font-weight: 600;")
+
 
 
     def switch_mode(self, mode):
