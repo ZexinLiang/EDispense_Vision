@@ -6,8 +6,6 @@ export QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/qt5/plugins/platfo
 # 触摸屏映射到HDMI-1 + 禁用GNOME手势
 xinput set-prop "wch.cn USB2IIC_CTP_CONTROL" "Coordinate Transformation Matrix" 0.652174 0 0 0 1 0 0 0 1
 xinput set-prop "wch.cn USB2IIC_CTP_CONTROL" "libinput Calibration Matrix" 1 0 0 0 1 0 0 0 1
-gsettings set org.gnome.mutter overlay-key "" 2>/dev/null
-gsettings set org.gnome.desktop.interface enable-hot-corners false 2>/dev/null
 
 cd /home/elf/solder_system
 python3 ui/solder_ui.py

@@ -29,6 +29,7 @@ import time
 import subprocess
 
 from PyQt5.QtWidgets import (
+    QDialog,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QGroupBox, QTextEdit,
     QProgressBar, QLineEdit, QSizePolicy
@@ -40,12 +41,12 @@ from PyQt5.QtGui import QPainter, QPainterPath, QImage, QPixmap, QFont, QFontDat
 # 路径配置
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TINNING_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'tinning_640_640.rknn')
-AOI_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'aoi_640_640.rknn')
+TINNING_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'pad.rknn')
+AOI_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'qs.rknn')
 # 兼容旧变量名：点锡模型
 MODEL_PATH = TINNING_MODEL_PATH
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
-AOI_IMAGE_DIR = '/run/media/mmcblk1p1/AOI_Picture'
+AOI_IMAGE_DIR = '/media/elf/OPI_BOOT/AOI_Picture'
 sys.path.insert(0, os.path.join(BASE_DIR, 'vision'))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -72,6 +73,111 @@ def S(base_val):
 # iOS风格 Stepper 控件
 # ============================================================
 
+
+
+
+class NumPadDialog(QDialog):
+    """触摸屏数字键盘弹窗(iOS风格,深色)。返回输入的数值字符串。"""
+    def __init__(self, parent=None, title="输入数值", init_value="", allow_negative=False):
+        """初始化数字键盘弹窗：标题/初值/是否允许负号"""
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self._value = str(init_value)
+        self._allow_neg = allow_negative
+        s = get_scale()
+        self.setFixedSize(int(320*s), int(420*s))
+        self.setStyleSheet(f"QDialog {{ background: #1c1c1e; border-radius: {int(16*s)}px; }}")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(int(16*s),int(16*s),int(16*s),int(16*s))
+        lay.setSpacing(int(10*s))
+
+        # 标题
+        lbl_title = QLabel(title)
+        lbl_title.setAlignment(Qt.AlignCenter)
+        lbl_title.setStyleSheet(f"color:#8e8e93; font-size:{int(13*s)}px; font-weight:600;")
+        lay.addWidget(lbl_title)
+
+        # 显示框
+        self.display = QLabel(self._value or "0")
+        self.display.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.display.setStyleSheet(
+            f"background:#000; color:#fff; font-size:{int(28*s)}px; font-weight:700;"
+            f"border-radius:{int(10*s)}px; padding:{int(8*s)}px {int(14*s)}px;")
+        self.display.setFixedHeight(int(56*s))
+        lay.addWidget(self.display)
+
+        # 按键网格
+        grid = QGridLayout()
+        grid.setSpacing(int(8*s))
+        keys = [('1',0,0),('2',0,1),('3',0,2),
+                ('4',1,0),('5',1,1),('6',1,2),
+                ('7',2,0),('8',2,1),('9',2,2),
+                ('.',3,0),('0',3,1),('⌫',3,2)]
+        for txt,row,col in keys:
+            b = QPushButton(txt)
+            b.setFixedSize(int(88*s),int(58*s))
+            is_special = txt in ('⌫','.')
+            b.setStyleSheet(f"""
+                QPushButton {{ background:{'#3a3a3c' if is_special else '#2c2c2e'}; color:#fff;
+                    font-size:{int(22*s)}px; font-weight:600; border:none;
+                    border-radius:{int(10*s)}px; }}
+                QPushButton:pressed {{ background:#0a84ff; }}
+            """)
+            b.clicked.connect(lambda _,t=txt: self._on_key(t))
+            grid.addWidget(b,row,col)
+        lay.addLayout(grid)
+
+        # 底部: 取消 + 确认
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(int(8*s))
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFixedHeight(int(50*s))
+        btn_cancel.setStyleSheet(f"QPushButton {{ background:#3a3a3c; color:#fff; font-size:{int(16*s)}px; border:none; border-radius:{int(10*s)}px; }} QPushButton:pressed {{ background:#555; }}")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("确认")
+        btn_ok.setFixedHeight(int(50*s))
+        btn_ok.setStyleSheet(f"QPushButton {{ background:#0a84ff; color:#fff; font-size:{int(16*s)}px; font-weight:600; border:none; border-radius:{int(10*s)}px; }} QPushButton:pressed {{ background:#0060df; }}")
+        btn_ok.clicked.connect(self.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        lay.addLayout(btn_row)
+
+    def _on_key(self, t):
+        """数字键盘按键回调：t为按键字符(0-9/./⌫/C)，更新输入缓冲"""
+        if t == '⌫':
+            self._value = self._value[:-1]
+        elif t == '.':
+            if '.' not in self._value:
+                self._value = (self._value or "0") + '.'
+        else:
+            if self._value == "0":
+                self._value = t
+            else:
+                self._value += t
+        self.display.setText(self._value or "0")
+
+    def get_value(self):
+        """返回用户输入的数值字符串"""
+        return self._value or "0"
+
+
+class TouchScrollTextEdit(QTextEdit):
+    """支持触摸拖动滚动的日志文本框(QScroller惯性滚动,丝滑)
+
+    用QScroller.grabGesture实现触摸惯性滚动。
+    注: 经验证GNOME OSK只弹一次是系统bug,与QScroller无关,故可放心使用。
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setReadOnly(True)
+        self.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        from PyQt5.QtWidgets import QScroller
+        self.viewport().setAttribute(Qt.WA_AcceptTouchEvents, True)
+        QScroller.grabGesture(self.viewport(), QScroller.LeftMouseButtonGesture)
 
 
 class PinchZoomLabel(QLabel):
@@ -387,7 +493,17 @@ class InferenceThread(QThread):
     def __init__(self, model_path):
         """初始化推理线程：指定RKNN模型路径"""
         super().__init__()
+        self._current_x = 0.0
+        self._current_y = 0.0
+        self._current_z = 0
+        try:
+            from motor_control import MotorController
+            self._motor = MotorController(logger=lambda m: self.log(m))
+            self._motor.connect()
+        except Exception:
+            self._motor = None
         self.model_path = model_path
+        self.conf_thresh = 0.25  # 由UI的置信度spin动态更新
         self.running = False
         self.cap = None
         self.rknn = None
@@ -417,7 +533,7 @@ class InferenceThread(QThread):
 
     def run(self):
         """推理线程主循环：读帧→裁剪中心1080x1080→letterbox→NPU推理→坐标映射→emit结果"""
-        from infer import letterbox, process_output, CONF_THRESH, NMS_THRESH, INPUT_SIZE
+        from infer import infer
         self.running = True
         if self.rknn is None:
             self.init_model()
@@ -435,31 +551,26 @@ class InferenceThread(QThread):
                 continue
 
             h, w = frame.shape[:2]
-            # 裁剪中心1080x1080用于模型推理
+            # === 单次推理：裁剪中心1080x1080正方形ROI → resize到1088 → NPU推理 ===
+            t0 = time.time()
             crop_size = min(h, w)  # 1080 for 1920x1080
             cx, cy = w // 2, h // 2
             x1_crop = cx - crop_size // 2
             y1_crop = cy - crop_size // 2
             infer_crop = frame[y1_crop:y1_crop+crop_size, x1_crop:x1_crop+crop_size]
 
-            t0 = time.time()
-            img_lb, r, pad = letterbox(infer_crop, (INPUT_SIZE, INPUT_SIZE))
-            img_in = np.expand_dims(img_lb, axis=0)
-            outputs = self.rknn.inference(inputs=[img_in])
-            bboxes, scores, class_ids = process_output(outputs, infer_crop.shape[:2], r, pad)
+            bboxes, scores, class_ids = infer(self.rknn, infer_crop, conf_thresh=self.conf_thresh)
             elapsed = (time.time() - t0) * 1000
 
-            # 检测坐标从crop坐标系映射回原图坐标系
+            # bboxes在ROI(1080)坐标系 → 偏移到原图坐标
             if len(bboxes) > 0:
                 bboxes[:, [0, 2]] += x1_crop
                 bboxes[:, [1, 3]] += y1_crop
 
-            # 裁剪中心1640x1080用于显示(保留更多上下文)
+            # 裁剪显示区域: 中心1640x1080
             disp_w = min(1640, w)
             x1_disp = cx - disp_w // 2
             display_frame = frame[0:h, x1_disp:x1_disp+disp_w].copy()
-
-            # 检测坐标映射到display_frame坐标系
             if len(bboxes) > 0:
                 bboxes[:, [0, 2]] -= x1_disp
 
@@ -550,17 +661,21 @@ class MainWindow(QMainWindow):
         mode_bar = QHBoxLayout()
         self.btn_solder = QPushButton("点锡模式")
         self.btn_aoi = QPushButton("AOI检测")
-        for btn in (self.btn_solder, self.btn_aoi):
+        self.btn_debug = QPushButton("调试")
+        for btn in (self.btn_solder, self.btn_aoi, self.btn_debug):
             btn.setCheckable(True)
             btn.setFixedHeight(S(34))
         self.btn_solder.setChecked(True)
         mode_font_style = f"font-size: {S(13)}px; font-weight: 600;"
         self.btn_solder.setStyleSheet(f"QPushButton {{ {mode_font_style} }} QPushButton:checked {{ background: #007aff; color: white; border: none; {mode_font_style} }}")
         self.btn_aoi.setStyleSheet(f"QPushButton {{ {mode_font_style} }} QPushButton:checked {{ background: #007aff; color: white; border: none; {mode_font_style} }}")
+        self.btn_debug.setStyleSheet(f"QPushButton {{ {mode_font_style} }} QPushButton:checked {{ background: #007aff; color: white; border: none; {mode_font_style} }}")
         self.btn_solder.clicked.connect(lambda: self.switch_mode("solder"))
         self.btn_aoi.clicked.connect(lambda: self.switch_mode("aoi"))
+        self.btn_debug.clicked.connect(lambda: self.switch_mode("debug"))
         mode_bar.addWidget(self.btn_solder)
         mode_bar.addWidget(self.btn_aoi)
+        mode_bar.addWidget(self.btn_debug)
         left_layout.addLayout(mode_bar)
 
         # 视频显示区
@@ -593,9 +708,11 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(left_layout, 1)
 
         # ===== 右侧面板 =====
-        right_widget = QWidget()
+        self._right_widget = QWidget()
+        right_widget = self._right_widget
         right_widget.setFixedWidth(S(280))
-        right_layout = QVBoxLayout(right_widget)
+        self._right_layout = QVBoxLayout(right_widget)
+        right_layout = self._right_layout
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(S(4))
 
@@ -651,6 +768,7 @@ class MainWindow(QMainWindow):
             return row
 
         self.spin_conf = IOSStepper(0.1, 0.9, 0.25, 0.05, 2)
+        self.spin_conf.valueChanged.connect(self._on_conf_changed)
         self.spin_spacing = IOSStepper(5, 50, 15, 5, 0)
         self.spin_dwell = IOSStepper(50, 1000, 200, 50, 0)
         self.spin_z = IOSStepper(1.0, 20.0, 5.0, 0.5, 1)
@@ -676,18 +794,20 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(param_group)
 
         # --- 日志 ---
-        log_group = QGroupBox("日志")
+        self.log_group = QGroupBox("日志")
+        log_group = self.log_group
         log_layout = QVBoxLayout(log_group)
-        self.log_text = QTextEdit()
+        self.log_text = TouchScrollTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.log_text.viewport().setAttribute(Qt.WA_AcceptTouchEvents, True)
-        from PyQt5.QtWidgets import QScroller
-        QScroller.grabGesture(self.log_text.viewport(), QScroller.TouchGesture)
         log_layout.addWidget(self.log_text)
         right_layout.addWidget(log_group, 1)
 
         main_layout.addWidget(right_widget)
+        
+        # 创建调试面板（隐藏在右侧面板同位置）
+        self._debug_widget = self._create_debug_panel()
+        main_layout.addWidget(self._debug_widget)
+        self._debug_widget.setVisible(False)
 
         # --- 信号连接 ---
         self.btn_start.clicked.connect(self.start_camera)
@@ -820,18 +940,37 @@ class MainWindow(QMainWindow):
         self.current_mode = mode
         self.btn_solder.setChecked(mode == "solder")
         self.btn_aoi.setChecked(mode == "aoi")
+        self.btn_debug.setChecked(mode == "debug")
         self.current_detections = None
         self.path_result = None
         self._update_mode_controls()
         if mode == "solder":
             self.log("⚙ 切换到 点锡模式")
+        elif mode == "debug":
+            self.log("🔧 切换到 调试模式")
+            pass  # 显隐由_update_mode_controls处理
         else:
             self.log("⚙ 切换到 AOI检测模式")
             self._ensure_aoi_dir()
 
     def _update_mode_controls(self):
-        """根据当前模式更新按钮可用性和文字(点锡/AOI差异化)"""
+        """根据当前模式更新按钮可用性和文字(点锡/AOI/调试差异化)"""
         is_solder = self.current_mode == "solder"
+        is_debug = self.current_mode == "debug"
+        # 调试模式：隐藏整个右侧控制面板，显示调试面板
+        if hasattr(self, '_right_widget'):
+            self._right_widget.setVisible(not is_debug)
+        if hasattr(self, '_debug_widget'):
+            self._debug_widget.setVisible(is_debug)
+        # 日志跟随模式：调试模式移到调试面板右栏，其他模式回right_widget
+        if hasattr(self, 'log_group') and hasattr(self, '_debug_log_slot'):
+            if is_debug:
+                self._debug_log_slot.addWidget(self.log_group)
+            elif self._right_layout.indexOf(self.log_group) < 0:
+                self._right_layout.addWidget(self.log_group, 1)
+        if is_debug:
+            self.lbl_path.setText("调试模式")
+            return
         self.btn_capture.setText("◎ 路径生成" if is_solder else "◎ 锁定当前帧")
         self.btn_capture.setEnabled(True)
         self.btn_load.setEnabled(not is_solder)
@@ -900,11 +1039,14 @@ class MainWindow(QMainWindow):
         _test.release()
         # 验证通过，启动推理线程
         self.infer_thread = InferenceThread(self._current_model_path())
+        self.infer_thread.conf_thresh = float(self.spin_conf.value())
         self.infer_thread.result_ready.connect(self.on_result)
         self.infer_thread.set_camera(cam_id)
         self.infer_thread.start()
         self._frozen = False
         self._edit_mode = False
+        self._current_x = 0.0
+        self._current_y = 0.0
         self._selection_mask = []
         self.path_result = None
         self.btn_execute.setEnabled(False)
@@ -929,7 +1071,7 @@ class MainWindow(QMainWindow):
         if self.current_mode == 'solder' and self.current_detections:
             # 仅首次进入编辑模式时初始化为全选；已在编辑模式则保留之前的选中状态
             if not self._edit_mode or len(self._selection_mask) != len(self.current_detections):
-                self._selection_mask = [True] * len(self.current_detections)
+                self._selection_mask = [int(d[2]) == 1 for d in self.current_detections]  # 默认只选pad(class=1),hole/qfn不选
             self._edit_mode = True
             self._redraw_edit_frame()
             self.log("◎ 编辑模式：点击框可取消/恢复选中")
@@ -940,17 +1082,22 @@ class MainWindow(QMainWindow):
         if self.current_frame is None:
             return
         vis = self.current_frame.copy()
+        overlay = vis.copy()
+        has_mask = False
+        # 先在overlay上画所有选中框的填充蒙版(只copy一次)
         for i, det in enumerate(self.current_detections):
-            bbox, score, cls_id = det
-            x1, y1, x2, y2 = [int(v) for v in bbox]
             if self._selection_mask[i]:
-                # 选中：画蒙版 + 边框
-                overlay = vis.copy()
+                x1, y1, x2, y2 = [int(v) for v in det[0]]
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 160, 0), -1)
-                vis = cv2.addWeighted(overlay, 0.35, vis, 0.65, 0)
+                has_mask = True
+        if has_mask:
+            vis = cv2.addWeighted(overlay, 0.35, vis, 0.65, 0)
+        # 再画所有边框
+        for i, det in enumerate(self.current_detections):
+            x1, y1, x2, y2 = [int(v) for v in det[0]]
+            if self._selection_mask[i]:
                 cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
             else:
-                # 未选中：稍暗绿色细框，无蒙版
                 cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
         self.display_frame(vis)
 
@@ -1055,15 +1202,20 @@ class MainWindow(QMainWindow):
     def _infer_once(self, frame, model_path):
         """对单帧执行一次RKNN推理(阻塞)，返回(bboxes, scores, class_ids, elapsed_ms)"""
         from rknnlite.api import RKNNLite
-        from infer import letterbox, process_output, INPUT_SIZE
+        from infer import infer
         rknn = RKNNLite()
         rknn.load_rknn(model_path)
         rknn.init_runtime()
         t0 = time.time()
-        img_lb, r, pad = letterbox(frame, (INPUT_SIZE, INPUT_SIZE))
-        img_in = np.expand_dims(img_lb, axis=0)
-        outputs = rknn.inference(inputs=[img_in])
-        bboxes, scores, class_ids = process_output(outputs, frame.shape[:2], r, pad)
+        # frame裁剪中心正方形ROI送推理
+        fh, fw = frame.shape[:2]
+        side = min(fh, fw)
+        rx, ry = (fw - side) // 2, (fh - side) // 2
+        roi = frame[ry:ry+side, rx:rx+side]
+        bboxes, scores, class_ids = infer(rknn, roi)
+        if len(bboxes) > 0:
+            bboxes[:, [0, 2]] += rx
+            bboxes[:, [1, 3]] += ry
         try:
             rknn.release()
         except Exception:
@@ -1071,15 +1223,26 @@ class MainWindow(QMainWindow):
         elapsed = (time.time() - t0) * 1000
         return list(zip(bboxes, scores, class_ids)) if len(bboxes) > 0 else [], elapsed
 
-    def _draw_detections(self, frame, detections, color=(0, 0, 255), prefix="DEFECT"):
-        """在帧上绘制检测框和标签，返回标注后的图像副本"""
+    # 类别名与颜色 (0=hole, 1=pad, 2=qfn)
+    CLASS_NAMES = ("hole", "pad", "qfn")
+    CLASS_COLORS = ((0, 165, 255), (0, 255, 0), (255, 128, 0))  # hole橙, pad绿, qfn蓝
+
+    def _draw_detections(self, frame, detections, color=None, prefix=None):
+        """在帧上绘制检测框和标签。color/prefix为None时按类别自动着色+真实类别名。"""
         vis = frame.copy()
         for bbox, score, cls_id in detections:
             x1, y1, x2, y2 = map(int, bbox)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = f"{prefix}{int(cls_id)} {score:.2f}"
+            ci = int(cls_id)
+            if color is None:
+                c = self.CLASS_COLORS[ci] if 0 <= ci < len(self.CLASS_COLORS) else (0, 255, 0)
+                name = self.CLASS_NAMES[ci] if 0 <= ci < len(self.CLASS_NAMES) else str(ci)
+            else:
+                c = color
+                name = (prefix or "") + (self.CLASS_NAMES[ci] if 0 <= ci < len(self.CLASS_NAMES) else str(ci))
+            cv2.rectangle(vis, (x1, y1), (x2, y2), c, 2)
+            label = f"{name} {score:.2f}"
             cv2.putText(vis, label, (x1, max(15, y1 - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
         return vis
 
     def execute_aoi(self):
@@ -1166,7 +1329,7 @@ class MainWindow(QMainWindow):
             vis = self._draw_detections(frame, detections, color=(0, 0, 255), prefix="NG")
             self.lbl_det.setText(f"缺陷: {len(detections)} 个")
         else:
-            vis = self._draw_detections(frame, detections, color=(0, 255, 0), prefix="PAD")
+            vis = self._draw_detections(frame, detections)
 
         self.display_frame(vis)
 
@@ -1208,6 +1371,296 @@ class MainWindow(QMainWindow):
             if current in self.combo_cam.itemText(idx):
                 self.combo_cam.setCurrentIndex(idx)
                 break
+
+
+    # ============================================================
+    # 调试模式面板与通信
+    # ============================================================
+    def _create_debug_panel(self):
+        """创建调试模式面板(双栏布局)：左栏=XY/Z控制+步进，右栏=目标坐标+操作+状态+激光"""
+        from PyQt5.QtWidgets import QGroupBox, QGridLayout, QLineEdit, QSizePolicy
+        
+        panel = QWidget()
+        panel.setFixedWidth(S(560))
+        two_col = QHBoxLayout(panel)
+        two_col.setSpacing(S(10))
+        two_col.setContentsMargins(S(6), S(6), S(6), S(6))
+        
+        # ===== 左栏 =====
+        left_col = QVBoxLayout()
+        left_col.setSpacing(S(8))
+        
+        # 状态指示
+        status_grp = QGroupBox("系统状态")
+        status_lay = QHBoxLayout(status_grp)
+        self._dbg_status_led = QLabel("⚪")
+        self._dbg_status_led.setStyleSheet(f"font-size: {S(18)}px;")
+        self._dbg_status_txt = QLabel("未连接")
+        self._dbg_status_txt.setStyleSheet(f"font-size: {S(11)}px; font-weight: bold;")
+        status_lay.addWidget(self._dbg_status_led)
+        status_lay.addWidget(self._dbg_status_txt)
+        status_lay.addStretch()
+        left_col.addWidget(status_grp)
+        
+        # 实时坐标
+        coord_grp = QGroupBox("实时坐标")
+        coord_lay = QHBoxLayout(coord_grp)
+        self._lbl_coord_x = QLabel("X: 0.0")
+        self._lbl_coord_y = QLabel("Y: 0.0")
+        self._lbl_coord_z = QLabel("Z: --")
+        for lbl in (self._lbl_coord_x, self._lbl_coord_y, self._lbl_coord_z):
+            lbl.setStyleSheet(f"font-size: {S(11)}px; font-weight: bold; font-family: monospace;")
+            coord_lay.addWidget(lbl)
+        left_col.addWidget(coord_grp)
+        
+        # XY方向控制
+        xy_grp = QGroupBox("XY 移动")
+        xy_grid = QGridLayout(xy_grp)
+        xy_grid.setSpacing(S(10))
+        btn_style = f"font-size: {S(16)}px; min-height: {S(50)}px; min-width: {S(50)}px; border-radius: {S(8)}px; background: #e5e5ea;"
+        btn_up = QPushButton("▲")
+        btn_down = QPushButton("▼")
+        btn_left = QPushButton("◀")
+        btn_right = QPushButton("▶")
+        for b in (btn_up, btn_down, btn_left, btn_right):
+            b.setStyleSheet(btn_style)
+        xy_grid.addWidget(btn_up, 0, 1)
+        xy_grid.addWidget(btn_left, 1, 0)
+        xy_grid.addWidget(btn_right, 1, 2)
+        xy_grid.addWidget(btn_down, 2, 1)
+        btn_up.clicked.connect(lambda: self._cmd_xy_move(0, 1))
+        btn_down.clicked.connect(lambda: self._cmd_xy_move(0, -1))
+        btn_left.clicked.connect(lambda: self._cmd_xy_move(-1, 0))
+        btn_right.clicked.connect(lambda: self._cmd_xy_move(1, 0))
+        left_col.addWidget(xy_grp)
+        
+        # Z轴控制
+        z_grp = QGroupBox("Z 轴")
+        z_lay = QHBoxLayout(z_grp)
+        btn_z_up = QPushButton("▲ Z上")
+        btn_z_down = QPushButton("▼ Z下")
+        for b in (btn_z_up, btn_z_down):
+            b.setStyleSheet(f"font-size: {S(11)}px; min-height: {S(38)}px; background: #e5e5ea; border-radius: {S(8)}px;")
+        btn_z_up.clicked.connect(lambda: self._cmd_z_move(1))
+        btn_z_down.clicked.connect(lambda: self._cmd_z_move(-1))
+        z_lay.addWidget(btn_z_up)
+        z_lay.addWidget(btn_z_down)
+        left_col.addWidget(z_grp)
+        
+        # 步进量选择
+        step_grp = QGroupBox("步进量 (mm)")
+        step_lay = QHBoxLayout(step_grp)
+        self._step_btns = []
+        for val in [1, 5, 10, 50]:
+            b = QPushButton(str(val))
+            b.setCheckable(True)
+            b.setStyleSheet(f"font-size: {S(11)}px; min-height: {S(30)}px; border-radius: {S(6)}px;")
+            b.clicked.connect(lambda checked, v=val: self._set_step_size(v))
+            step_lay.addWidget(b)
+            self._step_btns.append((b, val))
+        self._step_btns[1][0].setChecked(True)
+        self._step_size = 5.0
+        left_col.addWidget(step_grp)
+        
+        left_col.addStretch()
+        two_col.addLayout(left_col)
+        
+        # ===== 右栏 =====
+        right_col = QVBoxLayout()
+        right_col.setSpacing(S(8))
+        
+        # 目标坐标输入
+        goto_grp = QGroupBox("运动到坐标")
+        goto_lay = QHBoxLayout(goto_grp)
+        self._input_x = QLineEdit("0.0")
+        self._input_y = QLineEdit("0.0")
+        self._input_x.setFixedWidth(S(55))
+        self._input_y.setFixedWidth(S(55))
+        self._input_x.setStyleSheet(f"font-size: {S(11)}px;")
+        self._input_y.setStyleSheet(f"font-size: {S(11)}px;")
+        btn_goto = QPushButton("Go")
+        btn_goto.setStyleSheet(f"font-size: {S(11)}px; min-height: {S(32)}px; background: #007aff; color: white; border: none; border-radius: {S(8)}px; padding: 0 {S(10)}px;")
+        btn_goto.clicked.connect(self._cmd_goto_xy)
+        goto_lay.addWidget(QLabel("X:"))
+        goto_lay.addWidget(self._input_x)
+        goto_lay.addWidget(QLabel("Y:"))
+        goto_lay.addWidget(self._input_y)
+        goto_lay.addWidget(btn_goto)
+        right_col.addWidget(goto_grp)
+        
+        # 操作按钮
+        action_grp = QGroupBox("操作")
+        action_lay = QVBoxLayout(action_grp)
+        btn_home = QPushButton("🏠 回零")
+        btn_home.setFixedHeight(S(40))
+        btn_home.setStyleSheet(f"font-size: {S(11)}px; background: #34c759; color: white; border: none; border-radius: {S(8)}px;")
+        btn_home.clicked.connect(self._cmd_home)
+        btn_estop = QPushButton("🛑 急停")
+        btn_estop.setFixedHeight(S(40))
+        btn_estop.setStyleSheet(f"font-size: {S(11)}px; background: #ff3b30; color: white; border: none; border-radius: {S(8)}px;")
+        btn_estop.clicked.connect(self._cmd_estop)
+        btn_squeeze = QPushButton("💧 挤锡")
+        btn_squeeze.setFixedHeight(S(40))
+        btn_squeeze.setStyleSheet(f"font-size: {S(11)}px; background: #ff9500; color: white; border: none; border-radius: {S(8)}px;")
+        btn_squeeze.clicked.connect(self._cmd_squeeze)
+        action_lay.addWidget(btn_home)
+        action_lay.addWidget(btn_estop)
+        action_lay.addWidget(btn_squeeze)
+        right_col.addWidget(action_grp)
+        
+        # 激光测距
+        laser_grp = QGroupBox("激光测距")
+        laser_lay = QHBoxLayout(laser_grp)
+        self._lbl_laser = QLabel("距离: -- mm")
+        self._lbl_laser.setStyleSheet(f"font-size: {S(12)}px; font-weight: bold;")
+        laser_lay.addWidget(self._lbl_laser)
+        right_col.addWidget(laser_grp)
+        
+        # 日志占位(调试模式时log_group移到这里)
+        self._debug_log_slot = QVBoxLayout()
+        right_col.addLayout(self._debug_log_slot, 1)
+        two_col.addLayout(right_col)
+        
+        return panel
+
+
+    def _set_step_size(self, val):
+        """设置步进量并更新按钮选中状态"""
+        self._step_size = float(val)
+        for btn, v in self._step_btns:
+            btn.setChecked(v == val)
+        self.log(f"步进量: {val} mm")
+
+    def _cmd_xy_move(self, dx_sign, dy_sign):
+        """XY方向移动(框架stub)
+        Args:
+            dx_sign: -1/0/1 表示X方向
+            dy_sign: -1/0/1 表示Y方向
+        TODO: 实际发送 0x01 帧(绝对坐标) 到STM32
+        """
+        dx = dx_sign * self._step_size
+        dy = dy_sign * self._step_size
+        self._current_x = max(0.0, min(247.5, self._current_x + dx))
+        self._current_y = max(0.0, min(247.5, self._current_y + dy))
+        self._update_coord_display()
+        self._set_motion_state("moving")
+        self.log(f"XY移动 → X={self._current_x:.1f} Y={self._current_y:.1f} mm")
+        self._send_cmd(0x01, self._current_x, self._current_y)
+
+    def _cmd_z_move(self, direction):
+        """Z轴步进移动(框架stub)
+        Args:
+            direction: 1=上, -1=下
+        TODO: 实际发送 0x06 帧(Z步数) 到STM32
+        """
+        steps = int(direction * self._step_size * 10)  # 0.1mm单位
+        self._set_motion_state("moving")
+        self.log(f"Z轴 {'上' if direction>0 else '下'} {self._step_size}mm ({steps}步)")
+        self._send_cmd(0x06, steps)
+
+    def _popup_numpad(self, line_edit, title):
+        """点击输入框弹出自定义数字键盘"""
+        dlg = NumPadDialog(self, title=title, init_value=line_edit.text())
+        # 居中显示在主窗口
+        dlg.move(self.geometry().center().x() - dlg.width()//2,
+                 self.geometry().center().y() - dlg.height()//2)
+        if dlg.exec_() == QDialog.Accepted:
+            line_edit.setText(dlg.get_value())
+
+    def _cmd_goto_xy(self):
+        """运动到指定XY坐标(框架stub)
+        TODO: 解析输入框数值，发送0x01帧
+        """
+        try:
+            tx = float(self._input_x.text())
+            ty = float(self._input_y.text())
+            tx = max(0.0, min(247.5, tx))
+            ty = max(0.0, min(247.5, ty))
+            self._current_x = tx
+            self._current_y = ty
+            self._update_coord_display()
+            self._set_motion_state("moving")
+            self.log(f"运动到 X={tx:.1f} Y={ty:.1f} mm")
+            self._send_cmd(0x01, tx, ty)
+        except ValueError:
+            self.log("⚠ 坐标输入无效")
+
+    def _cmd_home(self):
+        """回零(框架stub)
+        TODO: 发送0x03帧
+        """
+        self._current_x = 0.0
+        self._current_y = 0.0
+        self._update_coord_display()
+        self._set_motion_state("moving")
+        self.log("回零指令")
+        self._send_cmd(0x03)
+
+    def _cmd_estop(self):
+        """急停(框架stub)
+        TODO: 发送0x02帧
+        """
+        self._set_motion_state("estop")
+        self.log("🛑 急停！")
+        self._send_cmd(0x02)
+
+    def _cmd_squeeze(self):
+        """挤锡测试(框架stub)
+        TODO: 发送0x07帧(挤锡1次)
+        """
+        self.log("💧 挤锡1次")
+        self._send_cmd(0x07, 1)
+
+    def _on_conf_changed(self, val):
+        """置信度spin变化时，更新推理线程的阈值(实时生效)"""
+        if self.infer_thread is not None:
+            self.infer_thread.conf_thresh = float(val)
+
+    def _update_coord_display(self):
+        """更新调试面板的XYZ坐标显示"""
+        if hasattr(self, '_lbl_coord_x'):
+            self._lbl_coord_x.setText(f"X: {self._current_x:.1f}")
+            self._lbl_coord_y.setText(f"Y: {self._current_y:.1f}")
+
+    def _set_motion_state(self, state):
+        """更新运动状态指示灯
+        Args:
+            state: 'idle'|'moving'|'estop'
+        """
+        if not hasattr(self, '_dbg_status_led'):
+            return
+        if state == "moving":
+            self._dbg_status_led.setText("🟢")
+            self._dbg_status_txt.setText("运动中")
+        elif state == "estop":
+            self._dbg_status_led.setText("🔴")
+            self._dbg_status_txt.setText("急停")
+        else:
+            self._dbg_status_led.setText("⚪")
+            self._dbg_status_txt.setText("已停止")
+
+    def _send_cmd(self, cmd_id, *args):
+        """[接口预留] 发送命令到STM32
+        协议: AA 55 ID [payload] checksum
+        当前为stub，待STM32端USB CDC命令解析完成后实现
+        """
+        # 通过motor_control发送(已封装,见motor_control.py)
+        if self._motor is None:
+            self.log(f"[send_cmd] 无motor id=0x{cmd_id:02X} args={args}")
+            return
+        # cmd_id分派到motor接口
+        try:
+            if cmd_id == 0x01:   self._motor.move_to(args[0], args[1])
+            elif cmd_id == 0x02: self._motor.estop()
+            elif cmd_id == 0x03: self._motor.home()
+            elif cmd_id == 0x06: self._motor.move_z(args[0])
+            elif cmd_id == 0x07: self._motor.squeeze(args[0] if args else 1)
+        except Exception as e:
+            self.log(f"send_cmd出错: {e}")
+
+
+
+
 
     def closeEvent(self, event):
         """窗口关闭事件：停止推理线程，释放资源"""
