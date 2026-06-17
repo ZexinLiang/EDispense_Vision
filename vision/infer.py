@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-RKNN YOLOv5 推理模块
-===================
-功能: 在 RK3588 NPU 上运行 YOLOv5n 模型，用于焊盘检测(点锡模式)或缺陷检测(AOI模式)。
-
-流程:
-    1. letterbox() - 将原图缩放+补灰边到 640x640 保持宽高比
-    2. RKNN推理 - 输入640x640 uint8图像，输出检测张量
-    3. process_output() - 解码YOLO输出，执行NMS，将坐标映射回原图
-
-支持两种RKNN输出格式:
-    - 单输出: [1, N, 5+C] 格式 (已后处理的)
-    - 三头输出: (1,24,80,80), (1,24,40,40), (1,24,20,20) (需手动解码anchor)
-
-依赖: rknnlite (RK3588 NPU SDK), OpenCV, NumPy
+RKNN YOLOv5 推理模块 (1088输入, 移植自转模型验证代码 test-1088-1088.py)
+=====================================================================
+预处理: 输入正方形ROI(1080x1080) → 直接resize到1088x1088 (BGR→RGB)
+后处理: rknn_model_zoo官方yolov5后处理, 按类别分组NMS(不同类不互相抑制)
+类别: 0=hole, 1=pad, 2=qfn
 """
 
 import cv2
@@ -21,262 +12,188 @@ import numpy as np
 from rknnlite.api import RKNNLite
 import time
 
-# ============================================================
-# 全局配置常量
-# ============================================================
-MODEL_PATH = '/home/elf/yolo/material-640-640-v5n.rknn'  # 默认模型路径(实际由UI动态指定)
-IMG_PATH = '/home/elf/yolo/1.jpg'      # 测试用图片路径
-OUTPUT_PATH = '/home/elf/yolo/result.jpg'  # 测试用输出路径
-
-CONF_THRESH = 0.25   # 置信度阈值: objectness * class_prob > 此值才保留
-NMS_THRESH = 0.45    # NMS IoU阈值: 重叠超过此值的框被抑制
-INPUT_SIZE = 640     # 模型输入尺寸 (正方形)
+MODEL_PATH = '/home/elf/solder_system/models/pad.rknn'
+CONF_THRESH = 0.25      # OBJ_THRESH
+NMS_THRESH = 0.45
+INPUT_SIZE = 1088
+CLASSES = ("hole", "pad", "qfn")
+ANCHORS = [[10, 13], [16, 30], [33, 23], [30, 61], [62, 45],
+           [59, 119], [116, 90], [156, 198], [373, 326]]
 
 
-def letterbox(img, new_shape=(640, 640)):
-    """
-    Letterbox缩放: 等比缩放图像并用灰色(114)补边到目标尺寸。
-    
-    Args:
-        img: 原始BGR图像 (H, W, 3)
-        new_shape: 目标尺寸 (height, width)，默认 (640, 640)
-    
-    Returns:
-        img: 缩放补边后的图像 (new_shape[0], new_shape[1], 3)
-        r: 缩放比例 (float)，用于坐标反算
-        (dw, dh): 左/上补边像素数 (float)，用于坐标反算
-    """
-    shape = img.shape[:2]  # 原图 [H, W]
-    # 计算缩放比例(取较小值保证图像完全在目标内)
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    # 缩放后的实际尺寸(未补边)
-    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
-    # 需要补边的像素数(左右/上下各一半)
-    dw = (new_shape[1] - new_unpad[0]) / 2
-    dh = (new_shape[0] - new_unpad[1]) / 2
-    # 缩放
-    img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    # 补灰边
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-    return img, r, (dw, dh)
+def xywh2xyxy(x):
+    """[cx,cy,w,h] -> [x1,y1,x2,y2]"""
+    y = np.copy(x)
+    y[:, 0] = x[:, 0] - x[:, 2] / 2
+    y[:, 1] = x[:, 1] - x[:, 3] / 2
+    y[:, 2] = x[:, 0] + x[:, 2] / 2
+    y[:, 3] = x[:, 1] + x[:, 3] / 2
+    return y
 
 
-def sigmoid(x):
-    """Sigmoid激活函数，用于将原始logit转为概率值"""
-    return 1 / (1 + np.exp(-x))
+def _process(input, mask, anchors):
+    """解码单个检测头。input: (grid_h, grid_w, 3, 5+nc)"""
+    anchors = [anchors[i] for i in mask]
+    grid_h, grid_w = map(int, input.shape[0:2])
+
+    box_confidence = input[..., 4]
+    box_confidence = np.expand_dims(box_confidence, axis=-1)
+    box_class_probs = input[..., 5:]
+
+    box_xy = input[..., :2] * 2 - 0.5
+    col = np.tile(np.arange(0, grid_w), grid_w).reshape(-1, grid_w)
+    row = np.tile(np.arange(0, grid_h).reshape(-1, 1), grid_h)
+    col = col.reshape(grid_h, grid_w, 1, 1).repeat(3, axis=-2)
+    row = row.reshape(grid_h, grid_w, 1, 1).repeat(3, axis=-2)
+    grid = np.concatenate((col, row), axis=-1)
+    box_xy += grid
+    box_xy *= int(INPUT_SIZE / grid_h)
+
+    box_wh = pow(input[..., 2:4] * 2, 2)
+    box_wh = box_wh * anchors
+
+    box = np.concatenate((box_xy, box_wh), axis=-1)
+    return box, box_confidence, box_class_probs
 
 
-def process_output(outputs, img_shape, r, pad):
-    """
-    解码RKNN模型输出并执行NMS，返回原图坐标的检测结果。
-    
-    Args:
-        outputs: RKNN推理输出列表，支持单头或三头格式
-        img_shape: 原图尺寸 (H, W)，用于坐标边界裁剪
-        r: letterbox缩放比例
-        pad: (dw, dh) letterbox补边偏移
-    
-    Returns:
-        bboxes: numpy array [N, 4] 格式 [x1, y1, x2, y2] 原图像素坐标
-        scores: numpy array [N] 置信度分数
-        class_ids: numpy array [N] 类别ID
-        若无检测结果返回 ([], [], [])
-    """
-    print(f"Number of outputs: {len(outputs)}")
-    for i, out in enumerate(outputs):
-        print(f"  Output[{i}]: shape={out.shape}, dtype={out.dtype}, min={out.min():.3f}, max={out.max():.3f}")
+def _filter_boxes(boxes, box_confidences, box_class_probs):
+    """两道阈值过滤: obj_conf + class_score"""
+    boxes = boxes.reshape(-1, 4)
+    box_confidences = box_confidences.reshape(-1)
+    box_class_probs = box_class_probs.reshape(-1, box_class_probs.shape[-1])
 
-    # Single output: [1, N, 5+C] or [N, 5+C]
-    if len(outputs) == 1:
-        out = outputs[0]
-        if len(out.shape) == 3:
-            out = out[0]
-        boxes = out[:, :4]
-        obj_conf = out[:, 4]
-        class_probs = out[:, 5:]
+    _box_pos = np.where(box_confidences >= CONF_THRESH)
+    boxes = boxes[_box_pos]
+    box_confidences = box_confidences[_box_pos]
+    box_class_probs = box_class_probs[_box_pos]
 
-        if obj_conf.max() > 1.0 or obj_conf.min() < 0.0:
-            obj_conf = sigmoid(obj_conf)
-            class_probs = sigmoid(class_probs)
+    class_max_score = np.max(box_class_probs, axis=-1)
+    classes = np.argmax(box_class_probs, axis=-1)
+    _class_pos = np.where(class_max_score >= CONF_THRESH)
 
-        class_ids = np.argmax(class_probs, axis=1)
-        class_scores = np.max(class_probs, axis=1)
-        scores = obj_conf * class_scores
+    boxes = boxes[_class_pos]
+    classes = classes[_class_pos]
+    scores = (class_max_score * box_confidences)[_class_pos]
+    return boxes, classes, scores
 
-        mask = scores > CONF_THRESH
-        boxes = boxes[mask]
-        scores = scores[mask]
-        class_ids = class_ids[mask]
 
-        if len(boxes) == 0:
-            print("No detections above threshold")
-            return [], [], []
+def _nms_boxes(boxes, scores):
+    """单类别NMS"""
+    x = boxes[:, 0]
+    y = boxes[:, 1]
+    w = boxes[:, 2] - boxes[:, 0]
+    h = boxes[:, 3] - boxes[:, 1]
+    areas = w * h
+    order = scores.argsort()[::-1]
 
-        x1 = boxes[:, 0] - boxes[:, 2] / 2
-        y1 = boxes[:, 1] - boxes[:, 3] / 2
-        x2 = boxes[:, 0] + boxes[:, 2] / 2
-        y2 = boxes[:, 1] + boxes[:, 3] / 2
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x[i], x[order[1:]])
+        yy1 = np.maximum(y[i], y[order[1:]])
+        xx2 = np.minimum(x[i] + w[i], x[order[1:]] + w[order[1:]])
+        yy2 = np.minimum(y[i] + h[i], y[order[1:]] + h[order[1:]])
+        w1 = np.maximum(0.0, xx2 - xx1 + 0.00001)
+        h1 = np.maximum(0.0, yy2 - yy1 + 0.00001)
+        inter = w1 * h1
+        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+        inds = np.where(ovr <= NMS_THRESH)[0]
+        order = order[inds + 1]
+    return np.array(keep)
 
-        dw, dh = pad
-        x1 = (x1 - dw) / r
-        y1 = (y1 - dh) / r
-        x2 = (x2 - dw) / r
-        y2 = (y2 - dh) / r
 
-        bboxes = np.stack([x1, y1, x2, y2], axis=1)
+def yolov5_post_process(input_data):
+    """完整后处理: 解码3头 + 按类别分组NMS。返回(boxes,classes,scores)或(None,None,None)"""
+    masks = [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    boxes, classes, scores = [], [], []
+    for inp, mask in zip(input_data, masks):
+        b, c, s = _process(inp, mask, ANCHORS)
+        b, c, s = _filter_boxes(b, c, s)
+        boxes.append(b)
+        classes.append(c)
+        scores.append(s)
 
-        indices = cv2.dnn.NMSBoxes(
-            bboxes.tolist(), scores.tolist(), CONF_THRESH, NMS_THRESH
-        )
-        if len(indices) > 0:
-            indices = indices.flatten()
-            return bboxes[indices], scores[indices], class_ids[indices]
-        return [], [], []
+    boxes = np.concatenate(boxes)
+    boxes = xywh2xyxy(boxes)
+    classes = np.concatenate(classes)
+    scores = np.concatenate(scores)
 
-    # Multi-output from RKNN YOLOv5: 3 heads
-    # Output shape: (1, 3*nc_per_anchor, H, W) where nc_per_anchor = 5 + num_classes
-    # For this model: (1, 24, 80, 80), (1, 24, 40, 40), (1, 24, 20, 20)
-    # 24 = 3 anchors * (4 bbox + 1 obj + 3 classes) = 3 * 8
-    print("Multi-head output, decoding...")
-    
-    # YOLOv5n anchors (standard)
-    anchors = [
-        [[10,13],[16,30],[33,23]],    # P3/8
-        [[30,61],[62,45],[59,119]],    # P4/16
-        [[116,90],[156,198],[373,326]] # P5/32
-    ]
-    strides = [8, 16, 32]
-    
-    all_boxes = []
-    all_scores = []
-    all_class_ids = []
-    
-    for idx, out in enumerate(outputs):
-        # Remove batch dim: (1, 24, H, W) -> (24, H, W)
-        if len(out.shape) == 4:
-            out = out[0]
-        
-        c, h, w = out.shape
-        na = 3  # number of anchors
-        nc = c // na  # channels per anchor = 5 + num_classes
-        num_classes = nc - 5
-        
-        # Reshape: (24, H, W) -> (3, 8, H, W) -> (3, H, W, 8)
-        out = out.reshape(na, nc, h, w).transpose(0, 2, 3, 1)
-        # Now: (3, H, W, 8) where last dim = [x, y, w, h, obj, cls0, cls1, cls2]
-        
-        stride = strides[idx]
-        anchor = np.array(anchors[idx])
-        
-        grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-        
-        for a in range(na):
-            data = out[a]  # (H, W, 8)
-            
-            # Data is already sigmoid-ed (values in 0-1 range from RKNN output)
-            bx = (data[..., 0] * 2 - 0.5 + grid_x) * stride
-            by = (data[..., 1] * 2 - 0.5 + grid_y) * stride
-            bw = (data[..., 2] * 2) ** 2 * anchor[a][0]
-            bh = (data[..., 3] * 2) ** 2 * anchor[a][1]
-            obj = data[..., 4]
-            cls = data[..., 5:]
-            
-            cls_id = np.argmax(cls, axis=-1)
-            cls_score = np.max(cls, axis=-1)
-            score = obj * cls_score
-            
-            mask = score > CONF_THRESH
-            if not np.any(mask):
-                continue
-            
-            bx_f = bx[mask]
-            by_f = by[mask]
-            bw_f = bw[mask]
-            bh_f = bh[mask]
-            
-            # Convert to original image coords
-            dw, dh = pad
-            x1 = (bx_f - bw_f/2 - dw) / r
-            y1 = (by_f - bh_f/2 - dh) / r
-            x2 = (bx_f + bw_f/2 - dw) / r
-            y2 = (by_f + bh_f/2 - dh) / r
-            
-            all_boxes.extend(np.stack([x1,y1,x2,y2], axis=1).tolist())
-            all_scores.extend(score[mask].tolist())
-            all_class_ids.extend(cls_id[mask].tolist())
-    
-    if len(all_boxes) == 0:
-        print("No detections from multi-head")
-        return [], [], []
-    
-    all_boxes = np.array(all_boxes)
-    all_scores = np.array(all_scores)
-    all_class_ids = np.array(all_class_ids)
-    
-    print(f"  Pre-NMS detections: {len(all_boxes)}")
-    indices = cv2.dnn.NMSBoxes(all_boxes.tolist(), all_scores.tolist(), CONF_THRESH, NMS_THRESH)
-    if len(indices) > 0:
-        indices = indices.flatten()
-        return all_boxes[indices], all_scores[indices], all_class_ids[indices]
-    return [], [], []
+    nboxes, nclasses, nscores = [], [], []
+    for c in set(classes):
+        inds = np.where(classes == c)
+        b = boxes[inds]
+        cc = classes[inds]
+        s = scores[inds]
+        keep = _nms_boxes(b, s)
+        nboxes.append(b[keep])
+        nclasses.append(cc[keep])
+        nscores.append(s[keep])
+
+    if not nclasses and not nscores:
+        return None, None, None
+    boxes = np.concatenate(nboxes)
+    classes = np.concatenate(nclasses)
+    scores = np.concatenate(nscores)
+    return boxes, classes, scores
+
+
+def preprocess(roi_bgr):
+    """正方形ROI(BGR) → 1088x1088 RGB, 直接resize(轻微拉伸)。
+    返回 (img_input, scale) ; scale = ROI边长/1088, 用于坐标反算回ROI"""
+    side = roi_bgr.shape[0]  # 正方形, H==W
+    img = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    scale = side / INPUT_SIZE
+    return img, scale
+
+
+def reshape_outputs(outputs):
+    """RKNN三头输出 (1,24,H,W) → list of (H,W,3,8) 供后处理"""
+    input_data = []
+    for out in outputs:
+        # (1,24,H,W) -> (3,8,H,W)
+        d = out.reshape([3, -1] + list(out.shape[-2:]))
+        # -> (H,W,3,8)
+        input_data.append(np.transpose(d, (2, 3, 0, 1)))
+    return input_data
+
+
+def infer(rknn, roi_bgr, conf_thresh=None):
+    """完整推理: ROI(正方形BGR) → 检测结果(映射回ROI像素坐标)
+    返回 bboxes[N,4](x1y1x2y2), scores[N], class_ids[N]"""
+    global CONF_THRESH
+    if conf_thresh is not None:
+        CONF_THRESH = float(conf_thresh)
+    img, scale = preprocess(roi_bgr)
+    img_input = np.expand_dims(img, 0)
+    outputs = rknn.inference(inputs=[img_input], data_format=['nhwc'])
+    input_data = reshape_outputs(outputs)
+    boxes, classes, scores = yolov5_post_process(input_data)
+    if boxes is None:
+        return np.empty((0, 4)), np.empty((0,)), np.empty((0,), dtype=int)
+    # 坐标从1088空间反算回ROI空间
+    boxes = boxes * scale
+    return boxes, scores, classes.astype(int)
+
 
 def main():
-    print("=== YOLOv5 RKNN Inference ===")
-
+    """命令行测试入口：对指定图片跑推理并打印检测结果"""
+    import sys
     rknn = RKNNLite()
-
-    print(f"Loading model: {MODEL_PATH}")
-    ret = rknn.load_rknn(MODEL_PATH)
-    if ret != 0:
-        print(f"Load model failed! ret={ret}")
-        return
-
-    print("Init runtime...")
-    ret = rknn.init_runtime()
-    if ret != 0:
-        print(f"Init runtime failed! ret={ret}")
-        return
-
-    img = cv2.imread(IMG_PATH)
-    if img is None:
-        print(f"Failed to read image: {IMG_PATH}")
-        return
-    print(f"Input image: {img.shape}")
-
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized, r, pad = letterbox(img_rgb, (INPUT_SIZE, INPUT_SIZE))
-    print(f"Preprocessed: {img_resized.shape}, ratio={r:.3f}, pad={pad}")
-
-    # Add batch dimension: (640,640,3) -> (1,640,640,3)
-    img_input = np.expand_dims(img_resized, axis=0)
-    print(f"Input tensor shape: {img_input.shape}")
-
-    print("Running inference...")
+    rknn.load_rknn(MODEL_PATH)
+    rknn.init_runtime()
+    img = cv2.imread(sys.argv[1] if len(sys.argv) > 1 else '/home/elf/solder_system/data/1.jpg')
+    h, w = img.shape[:2]
+    side = min(h, w)
+    roi = img[(h-side)//2:(h-side)//2+side, (w-side)//2:(w-side)//2+side]
     t0 = time.time()
-    outputs = rknn.inference(inputs=[img_input])
-    t1 = time.time()
-    print(f"Inference time: {(t1-t0)*1000:.1f} ms")
-
-    bboxes, scores, class_ids = process_output(outputs, img.shape[:2], r, pad)
-
-    if len(bboxes) > 0:
-        print(f"\nDetections: {len(bboxes)}")
-        for i, (box, score, cls) in enumerate(zip(bboxes, scores, class_ids)):
-            x1, y1, x2, y2 = [int(v) for v in box]
-            print(f"  [{i}] class={int(cls)}, conf={score:.3f}, box=[{x1},{y1},{x2},{y2}]")
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img, f"{int(cls)}:{score:.2f}", (x1, y1-5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.imwrite(OUTPUT_PATH, img)
-        print(f"Result saved: {OUTPUT_PATH}")
-    else:
-        print("No detections")
-        cv2.imwrite(OUTPUT_PATH, img)
-
+    boxes, scores, cls = infer(rknn, roi)
+    print(f"infer {(time.time()-t0)*1000:.0f}ms, {len(boxes)} dets")
+    for b, s, c in zip(boxes, scores, cls):
+        print(f"  {CLASSES[c]} {s:.2f} {[int(v) for v in b]}")
     rknn.release()
-    print("Done!")
+
 
 if __name__ == '__main__':
     main()
