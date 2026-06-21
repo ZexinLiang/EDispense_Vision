@@ -4,3 +4,4 @@ output/
 *.jpg
 !data/1.jpg
 .DS_Store
+*.bak

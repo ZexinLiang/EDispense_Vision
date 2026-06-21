@@ -46,8 +46,11 @@ AOI_MODEL_PATH = os.path.join(BASE_DIR, 'models', 'qs.rknn')
 # 兼容旧变量名：点锡模型
 MODEL_PATH = TINNING_MODEL_PATH
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
+CONFIG_DIR = os.path.join(BASE_DIR, 'config')
+XY_CALIB_PATH = os.path.join(CONFIG_DIR, 'xy_calib.json')
 AOI_IMAGE_DIR = '/media/elf/OPI_BOOT/AOI_Picture'
 sys.path.insert(0, os.path.join(BASE_DIR, 'vision'))
+sys.path.insert(0, BASE_DIR)  # motor_control.py在项目根目录
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -171,6 +174,7 @@ class TouchScrollTextEdit(QTextEdit):
     注: 经验证GNOME OSK只弹一次是系统bug,与QScroller无关,故可放心使用。
     """
     def __init__(self, *args, **kwargs):
+        """初始化: 启用双指缩放手势, 初始化缩放/平移状态"""
         super().__init__(*args, **kwargs)
         self.setReadOnly(True)
         self.setTextInteractionFlags(Qt.NoTextInteraction)
@@ -493,21 +497,13 @@ class InferenceThread(QThread):
     def __init__(self, model_path):
         """初始化推理线程：指定RKNN模型路径"""
         super().__init__()
-        self._current_x = 0.0
-        self._current_y = 0.0
-        self._current_z = 0
-        try:
-            from motor_control import MotorController
-            self._motor = MotorController(logger=lambda m: self.log(m))
-            self._motor.connect()
-        except Exception:
-            self._motor = None
         self.model_path = model_path
         self.conf_thresh = 0.25  # 由UI的置信度spin动态更新
         self.running = False
         self.cap = None
         self.rknn = None
         self.mode = 'camera'
+        self.cam_id = None
 
     def init_model(self):
         """加载RKNN模型到NPU"""
@@ -518,7 +514,8 @@ class InferenceThread(QThread):
 
     def set_camera(self, cam_id):
         """设置摄像头输入源：打开设备并配置1920x1080 MJPG 30fps"""
-        self.cap = cv2.VideoCapture(cam_id)
+        self.cam_id = int(cam_id)
+        self.cap = cv2.VideoCapture(self.cam_id)
         # 设置MJPG编码 + 1920x1080全高清采集
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -591,6 +588,56 @@ class InferenceThread(QThread):
 
 
 # ============================================================
+# 摄像头预览线程 (仅取流显示, 不做推理, 用于调试模式针尖相机)
+# ============================================================
+class CameraPreviewThread(QThread):
+    """轻量摄像头预览线程: 只读帧并发信号, 不加载RKNN/不推理(省NPU)。
+    用于调试模式下显示针尖校准相机画面。"""
+    frame_ready = pyqtSignal(object)  # frame(BGR)
+    resolution_ready = pyqtSignal(int, int)  # 实际分辨率 w, h
+    open_failed = pyqtSignal(int)  # 打开失败, 携带cam_id
+
+    def __init__(self, cam_id):
+        super().__init__()
+        self.cam_id = cam_id
+        self.running = False
+        self.cap = None
+
+    def run(self):
+        """打开摄像头(MJPG 1920x1080)循环取帧"""
+        self.cap = cv2.VideoCapture(self.cam_id)
+        if not self.cap.isOpened():
+            self.open_failed.emit(self.cam_id)
+            return
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # 回读实际生效分辨率
+        aw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        ah = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.resolution_ready.emit(aw, ah)
+        self.running = True
+        while self.running:
+            if self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret:
+                    self.frame_ready.emit(frame)
+                else:
+                    time.sleep(0.01)
+            else:
+                time.sleep(0.05)
+            time.sleep(0.02)
+
+    def stop(self):
+        """停止预览并释放摄像头"""
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.wait()
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 class MainWindow(QMainWindow):
@@ -609,9 +656,24 @@ class MainWindow(QMainWindow):
         self._motor_online = False
         self._heartbeat_timer = QTimer(self)
         self._heartbeat_timer.timeout.connect(self._heartbeat_check)
-        self._heartbeat_timer.start(10000)  # 60s
+        self._heartbeat_timer.start(2000)  # 60s
         # 启动时立刻检测一次
         QTimer.singleShot(3000, self._heartbeat_check)
+
+        # 运动控制器(USB CDC) + 主线程状态轮询
+        self._current_x = 0.0
+        self._current_y = 0.0
+        self._current_z = 0
+        try:
+            from motor_control import MotorController
+            self._motor = MotorController(logger=lambda m: (self.log(m) if hasattr(self,'log_text') else print('[motor]',m)))
+            self._motor.connect()
+        except Exception as _e:
+            self.log(f"✗ 运动控制器初始化失败: {_e}")
+            self._motor = None
+        self._motor_poll_timer = QTimer(self)
+        self._motor_poll_timer.timeout.connect(self._poll_motor_state)
+        self._motor_poll_timer.start(200)
 
         self._scale = screen.width() / 1024.0
 
@@ -624,6 +686,20 @@ class MainWindow(QMainWindow):
         self.loaded_aoi_image = None
         self.loaded_aoi_path = None
         self._frozen = False
+        self._tip_preview = None   # 针尖校准相机预览线程(调试模式)
+        # XY标定状态
+        self._xy_calib_active = False
+        self._xy_calib_state = 'idle'   # idle/picking/locked/aligning
+        self._xy_calib_frame = None     # 冻结的顶部相机帧(BGR)
+        self._xy_calib_cur_px = None    # 当前候选像素点(u,v)
+        self._xy_calib_pairs = []       # [(u,v,X,Y), ...] 已记录的标定对
+        self._xy_calib_M = None         # 解算出的2x3仿射矩阵(像素→机床)
+        self._load_xy_calib()
+        # XY测试(验证标定准不准)状态
+        self._xytest_state = 'idle'     # idle/picking
+        self._xytest_frame = None       # 冻结顶图
+        self._xytest_px = None          # 选中像素(u,v)
+        self._xytest_xy = None          # 换算出的机床(X,Y)
 
         self._build_ui()
         self._apply_style()
@@ -678,12 +754,84 @@ class MainWindow(QMainWindow):
         mode_bar.addWidget(self.btn_debug)
         left_layout.addLayout(mode_bar)
 
+        # 针尖校准相机切换条(仅调试模式可见, 用于针头/板面标定预览)
+        self._tip_cam_bar = QWidget()
+        tip_cam_lay = QHBoxLayout(self._tip_cam_bar)
+        tip_cam_lay.setContentsMargins(0, 0, 0, 0)
+        tip_cam_lay.setSpacing(S(8))
+        tip_lbl = QLabel("针尖校准相机:")
+        tip_lbl.setStyleSheet(f"font-size: {S(12)}px; font-weight: 600;")
+        self.combo_tip_cam = QComboBox()
+        self.combo_tip_cam.addItems(["21", "23", "25"])
+        self.combo_tip_cam.setCurrentText("23")   # 默认针尖相机 /dev/video23
+        self.combo_tip_cam.setFixedHeight(S(30))
+        self.combo_tip_cam.currentTextChanged.connect(self._on_tip_cam_changed)
+        self.btn_tip_open = QPushButton("打开")
+        self.btn_tip_open.setFixedHeight(S(30))
+        self.btn_tip_open.setStyleSheet(f"font-size: {S(12)}px; background: #34c759; color: white; border: none; border-radius: {S(6)}px;")
+        self.btn_tip_open.clicked.connect(self._open_tip_cam)
+        self.btn_tip_close = QPushButton("关闭")
+        self.btn_tip_close.setFixedHeight(S(30))
+        self.btn_tip_close.setStyleSheet(f"font-size: {S(12)}px; background: #ff3b30; color: white; border: none; border-radius: {S(6)}px;")
+        self.btn_tip_close.clicked.connect(self._close_tip_cam)
+        self.btn_tip_close.setEnabled(False)
+        tip_cam_lay.addWidget(tip_lbl)
+        tip_cam_lay.addWidget(self.combo_tip_cam, 2)
+        tip_cam_lay.addWidget(self.btn_tip_open, 2)
+        tip_cam_lay.addWidget(self.btn_tip_close, 2)
+        self._tip_cam_bar.setVisible(False)
+        left_layout.addWidget(self._tip_cam_bar)
+
         # 视频显示区
         self.video_label = PinchZoomLabel("点击 [开始] 启动摄像头")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(S(400), S(300))
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         left_layout.addWidget(self.video_label, 1)
+
+        # 标定按钮区(仅调试模式可见): XY标定 / Z补偿
+        self._calib_bar = QWidget()
+        calib_v = QVBoxLayout(self._calib_bar)
+        calib_v.setContentsMargins(0, 0, 0, 0)
+        calib_v.setSpacing(S(4))
+        # 状态标签
+        self._lbl_calib_status = QLabel("标定: 空闲")
+        self._lbl_calib_status.setStyleSheet(f"font-size: {S(12)}px; font-weight: 600; color: #5856d6;")
+        calib_v.addWidget(self._lbl_calib_status)
+        # 主按钮行: XY标定 / Z补偿
+        calib_main = QHBoxLayout()
+        calib_main.setSpacing(S(6))
+        self.btn_xy_calib = QPushButton("XY标定")
+        self.btn_xy_calib.setFixedHeight(S(34))
+        self.btn_xy_calib.setStyleSheet(f"font-size: {S(12)}px; background: #5856d6; color: white; border: none; border-radius: {S(6)}px;")
+        self.btn_xy_calib.clicked.connect(self._xy_calib_start)
+        self.btn_z_calib = QPushButton("Z补偿")
+        self.btn_z_calib.setFixedHeight(S(34))
+        self.btn_z_calib.setStyleSheet(f"font-size: {S(12)}px; background: #8e8e93; color: white; border: none; border-radius: {S(6)}px;")
+        self.btn_z_calib.clicked.connect(lambda: self.log("⚠ Z补偿功能待实现"))
+        calib_main.addWidget(self.btn_xy_calib)
+        calib_main.addWidget(self.btn_z_calib)
+        calib_v.addLayout(calib_main)
+        # XY标定上下文按钮行(标定进行中才启用)
+        calib_ctx = QHBoxLayout()
+        calib_ctx.setSpacing(S(6))
+        self.btn_calib_lock = QPushButton("锁定点")
+        self.btn_calib_align = QPushButton("手动标定")
+        self.btn_calib_record = QPushButton("确认记录")
+        self.btn_calib_cancel = QPushButton("取消/重置")
+        for b, col in ((self.btn_calib_lock, "#34c759"), (self.btn_calib_align, "#007aff"),
+                       (self.btn_calib_record, "#ff9500"), (self.btn_calib_cancel, "#ff3b30")):
+            b.setFixedHeight(S(32))
+            b.setStyleSheet(f"font-size: {S(11)}px; background: {col}; color: white; border: none; border-radius: {S(6)}px;")
+            b.setEnabled(False)
+            calib_ctx.addWidget(b)
+        self.btn_calib_lock.clicked.connect(self._xy_calib_lock)
+        self.btn_calib_align.clicked.connect(self._xy_calib_align)
+        self.btn_calib_record.clicked.connect(self._xy_calib_record)
+        self.btn_calib_cancel.clicked.connect(self._xy_calib_cancel)
+        calib_v.addLayout(calib_ctx)
+        self._calib_bar.setVisible(False)
+        left_layout.addWidget(self._calib_bar)
 
         # 状态栏
         # 状态栏 - 固定高度Widget确保不被挤没
@@ -894,7 +1042,10 @@ class MainWindow(QMainWindow):
     # 业务逻辑
     # ----------------------------------------------------------
     def log(self, msg):
-        """向日志区域追加一条带时间戳的消息(⚠开头显示红色)"""
+        """向日志区追加带时间戳的消息。⚠/✗ 开头标红(警告/错误), 其余正常色。"""
+        if not hasattr(self, 'log_text'):
+            print('[log]', msg)
+            return
         ts = time.strftime('%H:%M:%S')
         if msg.startswith("⚠") or msg.startswith("✗"):
             self.log_text.append(f'<span style="color:#ff3b30">[{ts}] {msg}</span>')
@@ -902,20 +1053,10 @@ class MainWindow(QMainWindow):
             self.log_text.append(f"[{ts}] {msg}")
 
     def _heartbeat_check(self):
-        """每10s异步调用心跳脚本(QProcess非阻塞,不卡UI)"""
-        from PyQt5.QtCore import QProcess
-        if not hasattr(self, '_hb_process'):
-            self._hb_process = None
-        if self._hb_process and self._hb_process.state() != QProcess.NotRunning:
-            return
-        self._hb_process = QProcess(self)
-        self._hb_process.finished.connect(self._on_heartbeat_done)
-        self._hb_process.start('python3', ['/home/elf/solder_system/heartbeat_check.py'])
-
-    def _on_heartbeat_done(self, exit_code, exit_status):
-        """心跳结果回调(异步,不阻塞主线程)"""
+        """每10s基于STM32上行帧判定执行系统在线状态(不再依赖回显)。"""
+        online = bool(self._motor) and self._motor.is_online()
         was_online = self._motor_online
-        if exit_code == 0:
+        if online:
             if not was_online:
                 self.log("✓ 执行系统已上线")
             self._motor_online = True
@@ -933,6 +1074,10 @@ class MainWindow(QMainWindow):
     def switch_mode(self, mode):
         """切换工作模式：点锡(solder)↔AOI，停止当前推理并更新UI状态"""
         if mode == self.current_mode:
+            # QPushButton checkable默认可反选；点当前模式时强制保持选中, 避免三模式按钮全空
+            self.btn_solder.setChecked(mode == "solder")
+            self.btn_aoi.setChecked(mode == "aoi")
+            self.btn_debug.setChecked(mode == "debug")
             return
         # 两种模式使用不同RKNN模型，切换时停止实时线程，避免模型错用
         if self.infer_thread and self.infer_thread.isRunning():
@@ -968,6 +1113,16 @@ class MainWindow(QMainWindow):
                 self._debug_log_slot.addWidget(self.log_group)
             elif self._right_layout.indexOf(self.log_group) < 0:
                 self._right_layout.addWidget(self.log_group, 1)
+        # 针尖校准相机: 调试模式显示切换条(由用户手动开/关), 离开则停预览并复位按钮
+        if hasattr(self, '_tip_cam_bar'):
+            self._tip_cam_bar.setVisible(is_debug)
+            if not is_debug:
+                self._close_tip_cam()
+        # 标定按钮区: 仅调试模式可见, 离开则取消进行中的标定
+        if hasattr(self, '_calib_bar'):
+            self._calib_bar.setVisible(is_debug)
+            if not is_debug and self._xy_calib_active:
+                self._xy_calib_cancel()
         if is_debug:
             self.lbl_path.setText("调试模式")
             return
@@ -980,6 +1135,339 @@ class MainWindow(QMainWindow):
             self.lbl_path.setText("路径: -- 点")
         else:
             self.lbl_path.setText("AOI: --")
+
+    # ----------------------------------------------------------
+    # 针尖校准相机预览 (仅调试模式, 显示在左侧视频区)
+    # ----------------------------------------------------------
+    def _on_tip_cam_changed(self, text):
+        """针尖相机下拉切换: 若已打开则提示需重新打开新设备"""
+        if self._tip_preview and self._tip_preview.isRunning():
+            self.log(f"⚠ 已切换到相机 {text}, 请点[关闭]后重新[打开]以生效")
+
+    def _open_tip_cam(self):
+        """打开针尖校准相机预览(手动)。重复打开给提示。"""
+        if self._tip_preview and self._tip_preview.isRunning():
+            self.log("⚠ 针尖校准相机已打开")
+            return
+        try:
+            cam_id = int(self.combo_tip_cam.currentText())
+        except (ValueError, AttributeError):
+            cam_id = 23
+        self.log(f"📷 正在打开针尖校准相机 (/dev/video{cam_id}) ...")
+        self._tip_preview = CameraPreviewThread(cam_id)
+        self._tip_preview.frame_ready.connect(self._on_tip_frame)
+        self._tip_preview.resolution_ready.connect(self._on_tip_resolution)
+        self._tip_preview.open_failed.connect(self._on_tip_open_failed)
+        self._tip_preview.start()
+        self.btn_tip_open.setEnabled(False)
+        self.btn_tip_close.setEnabled(True)
+        self.combo_tip_cam.setEnabled(False)
+
+    def _close_tip_cam(self):
+        """关闭针尖校准相机预览(手动), 复位按钮与显示。"""
+        was_open = bool(self._tip_preview and self._tip_preview.isRunning())
+        if self._tip_preview:
+            self._tip_preview.stop()
+            self._tip_preview = None
+        self.btn_tip_open.setEnabled(True)
+        self.btn_tip_close.setEnabled(False)
+        self.combo_tip_cam.setEnabled(True)
+        if was_open:
+            self.log("📷 针尖校准相机已关闭")
+            self.video_label.setText("针尖校准相机已关闭")
+
+    def _on_tip_open_failed(self, cam_id):
+        """相机打开失败回调: 警告并复位按钮"""
+        self.log(f"✗ 针尖校准相机 /dev/video{cam_id} 打开失败, 请检查连接")
+        self._close_tip_cam()
+
+    def _on_tip_resolution(self, w, h):
+        """相机实际分辨率回调: 打到日志"""
+        self.log(f"✓ 针尖校准相机已打开, 实际分辨率 {w}x{h}")
+
+    def _on_tip_frame(self, frame):
+        """针尖相机帧回调: BGR帧转pixmap显示到左侧视频区"""
+        if self.current_mode != "debug":
+            return
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        label_size = self.video_label.size()
+        pixmap = QPixmap.fromImage(qimg).scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.video_label.setDisplayPixmap(pixmap)
+
+    # ----------------------------------------------------------
+    # XY 标定 (顶部相机像素 → 机床XY 仿射变换, 3点解算)
+    # ----------------------------------------------------------
+    def _grab_top_frame(self):
+        """抓取顶部相机(video21)单帧BGR, 失败返回None。临时打开即用即放。"""
+        try:
+            cam_id = 21
+            cap = cv2.VideoCapture(cam_id)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            frame = None
+            for _ in range(8):
+                ok, f = cap.read()
+                if ok:
+                    frame = f
+            cap.release()
+            return frame
+        except Exception as e:
+            self.log(f"✗ 顶部相机抓帧异常: {e}")
+            return None
+
+    def _xy_calib_start(self):
+        """开始XY标定: 停针尖预览, 抓顶部相机一帧冻结, 进入选点状态。"""
+        if self._xy_calib_active:
+            self.log("⚠ XY标定已在进行中")
+            return
+        self._close_tip_cam()  # 释放针尖相机, 避免占用
+        self.log("▸ XY标定: 正在抓取顶部相机画面...")
+        frame = self._grab_top_frame()
+        if frame is None:
+            self.log("✗ 顶部相机(/dev/video21)抓帧失败, 请检查连接")
+            return
+        self._xy_calib_active = True
+        self._xy_calib_state = 'picking'
+        self._xy_calib_frame = frame
+        self._xy_calib_cur_px = None
+        self._xy_calib_pairs = []
+        self._xy_calib_redraw()
+        self.btn_calib_cancel.setEnabled(True)
+        self.btn_calib_lock.setEnabled(False)
+        self.btn_calib_align.setEnabled(False)
+        self.btn_calib_record.setEnabled(False)
+        self._xy_calib_update_status()
+        self.log("▸ 已冻结顶部画面, 请在图上点击选择特征点(可双指放大)")
+
+    def _xy_calib_redraw(self):
+        """在冻结帧上叠加已记录红点+当前候选绿点, 显示到左侧。"""
+        if self._xy_calib_frame is None:
+            return
+        vis = self._xy_calib_frame.copy()
+        # 已锁定/已记录的点画红色十字+编号
+        for i, (u, v, X, Y) in enumerate(self._xy_calib_pairs):
+            cv2.drawMarker(vis, (int(u), int(v)), (0, 0, 255), cv2.MARKER_CROSS, 40, 3)
+            cv2.putText(vis, str(i + 1), (int(u) + 12, int(v) - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        # 当前候选点: locked画红, picking画绿
+        if self._xy_calib_cur_px is not None:
+            u, v = self._xy_calib_cur_px
+            col = (0, 0, 255) if self._xy_calib_state in ('locked', 'aligning') else (0, 200, 0)
+            cv2.drawMarker(vis, (int(u), int(v)), col, cv2.MARKER_CROSS, 40, 3)
+        self.display_frame(vis)
+
+    def _xy_calib_update_status(self):
+        """刷新标定状态标签"""
+        n = len(self._xy_calib_pairs)
+        if not self._xy_calib_active:
+            txt = "标定: 空闲"
+            if self._xy_calib_M is not None:
+                txt += " (已加载标定)"
+        else:
+            px = self._xy_calib_cur_px
+            pxs = f" 像素({int(px[0])},{int(px[1])})" if px else ""
+            txt = f"标定中[{self._xy_calib_state}] 已记录{n}/3{pxs}"
+        self._lbl_calib_status.setText(txt)
+
+    def _xy_calib_lock(self):
+        """锁定当前候选点: 绿点→红点, 显示像素坐标, 启用[手动标定]。"""
+        if self._xy_calib_state != 'picking' or self._xy_calib_cur_px is None:
+            self.log("⚠ 请先在图上点击一个点再锁定")
+            return
+        self._xy_calib_state = 'locked'
+        self.btn_calib_lock.setEnabled(False)
+        self.btn_calib_align.setEnabled(True)
+        u, v = self._xy_calib_cur_px
+        self.log(f"▸ 已锁定点 像素=({int(u)},{int(v)}), 请用右侧面板jog针尖到该物理位置")
+        self._xy_calib_redraw()
+        self._xy_calib_update_status()
+
+    def _xy_calib_align(self):
+        """打开针尖相机(video23)供精对准, 启用[确认记录]。"""
+        if self._xy_calib_state != 'locked':
+            self.log("⚠ 请先锁定点再手动标定")
+            return
+        self._xy_calib_state = 'aligning'
+        # 借用针尖相机预览(切到video23)
+        try:
+            self.combo_tip_cam.setCurrentText("23")
+        except Exception:
+            pass
+        self._open_tip_cam()
+        self.btn_calib_align.setEnabled(False)
+        self.btn_calib_record.setEnabled(True)
+        self.log("▸ 针尖相机已开, 对准后按[确认记录]记录当前机床XY")
+
+    def _xy_calib_record(self):
+        """记录当前机床XY与锁定像素配对; 满3点则解算保存。"""
+        if self._xy_calib_state != 'aligning' or self._xy_calib_cur_px is None:
+            self.log("⚠ 当前不可记录")
+            return
+        u, v = self._xy_calib_cur_px
+        X, Y = self._current_x, self._current_y
+        self._xy_calib_pairs.append((float(u), float(v), float(X), float(Y)))
+        self.log(f"✓ 记录点{len(self._xy_calib_pairs)}: 像素({int(u)},{int(v)}) ↔ 机床({X:.1f},{Y:.1f})")
+        # 关针尖相机, 切回冻结顶图
+        self._close_tip_cam()
+        self._xy_calib_cur_px = None
+        if len(self._xy_calib_pairs) >= 3:
+            self._xy_calib_solve_save()
+        else:
+            self._xy_calib_state = 'picking'
+            self.btn_calib_record.setEnabled(False)
+            self._xy_calib_redraw()
+            self._xy_calib_update_status()
+            self.log(f"▸ 请选择第 {len(self._xy_calib_pairs)+1} 个点")
+
+    def _xy_calib_solve_save(self):
+        """用3组点解算仿射矩阵(像素→机床), 计算残差, 存盘。"""
+        import numpy as np
+        pts = self._xy_calib_pairs
+        src = np.array([[u, v] for (u, v, X, Y) in pts], dtype=np.float32)
+        dst = np.array([[X, Y] for (u, v, X, Y) in pts], dtype=np.float32)
+        try:
+            M = cv2.getAffineTransform(src, dst)  # 2x3
+        except Exception as e:
+            self.log(f"✗ 解算失败: {e}, 请重置重标")
+            self._xy_calib_cancel()
+            return
+        # 残差: 把src点用M映射回机床坐标, 与dst比
+        res = []
+        for (u, v, X, Y) in pts:
+            mx = M[0, 0]*u + M[0, 1]*v + M[0, 2]
+            my = M[1, 0]*u + M[1, 1]*v + M[1, 2]
+            res.append(((mx-X)**2 + (my-Y)**2) ** 0.5)
+        max_res = max(res)
+        self._xy_calib_M = M
+        self._save_xy_calib(M, pts, max_res)
+        self.log(f"✓ XY标定完成! 仿射矩阵已保存, 最大残差 {max_res:.2f}mm")
+        # 收尾
+        self._xy_calib_active = False
+        self._xy_calib_state = 'idle'
+        for b in (self.btn_calib_lock, self.btn_calib_align, self.btn_calib_record, self.btn_calib_cancel):
+            b.setEnabled(False)
+        self._xy_calib_update_status()
+
+    def _xy_calib_cancel(self):
+        """取消/重置XY标定, 清状态。"""
+        self._xy_calib_active = False
+        self._xy_calib_state = 'idle'
+        self._xy_calib_frame = None
+        self._xy_calib_cur_px = None
+        self._xy_calib_pairs = []
+        self._close_tip_cam()
+        for b in (self.btn_calib_lock, self.btn_calib_align, self.btn_calib_record, self.btn_calib_cancel):
+            b.setEnabled(False)
+        self._xy_calib_update_status()
+        self.log("▸ XY标定已取消/重置")
+
+    def _save_xy_calib(self, M, pts, max_res):
+        """保存标定矩阵+原始点+时间戳到json。"""
+        import json
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            data = {
+                "affine_matrix": [[float(M[0, 0]), float(M[0, 1]), float(M[0, 2])],
+                                  [float(M[1, 0]), float(M[1, 1]), float(M[1, 2])]],
+                "points": [{"u": u, "v": v, "X": X, "Y": Y} for (u, v, X, Y) in pts],
+                "max_residual_mm": float(max_res),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(XY_CALIB_PATH, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"✗ 标定文件保存失败: {e}")
+
+    def _load_xy_calib(self):
+        """上电加载已保存的XY标定矩阵(若存在)。"""
+        import json
+        try:
+            if os.path.exists(XY_CALIB_PATH):
+                with open(XY_CALIB_PATH) as f:
+                    data = json.load(f)
+                import numpy as np
+                self._xy_calib_M = np.array(data["affine_matrix"], dtype=np.float64)
+                print(f"[xy_calib] loaded: {data.get('timestamp')}, residual={data.get('max_residual_mm')}")
+        except Exception as e:
+            print(f"[xy_calib] load failed: {e}")
+
+    def pixel_to_machine(self, u, v):
+        """用标定矩阵把顶部相机像素(u,v)换算为机床(X,Y)。未标定返回None。"""
+        if self._xy_calib_M is None:
+            return None
+        M = self._xy_calib_M
+        X = M[0, 0]*u + M[0, 1]*v + M[0, 2]
+        Y = M[1, 0]*u + M[1, 1]*v + M[1, 2]
+        return (float(X), float(Y))
+
+    # ----------------------------------------------------------
+    # XY测试: 在顶图选点→标定矩阵换算机床XY→GO移动(仅XY,不动Z)
+    # ----------------------------------------------------------
+    def _xytest_pick_toggle(self):
+        """选点/锁定点 切换。选点:抓顶图冻结进入picking; 锁定:换算XY,按钮变回选点可重选。"""
+        if self._xytest_state == 'idle':
+            if self._xy_calib_M is None:
+                self.log("⚠ 请先完成XY标定再测试")
+                return
+            # 若标定流程在进行中, 不抢占
+            if self._xy_calib_active:
+                self.log("⚠ 请先结束XY标定再测试")
+                return
+            self.log("▸ XY测试: 抓取顶部画面...")
+            frame = self._grab_top_frame()
+            if frame is None:
+                self.log("✗ 顶部相机抓帧失败")
+                return
+            self._xytest_state = 'picking'
+            self._xytest_frame = frame
+            self._xytest_px = None
+            self._xytest_xy = None
+            self._lbl_xytest.setText("XY: 点图选点")
+            self.display_frame(frame)
+            self._btn_xytest_pick.setText("锁定点")
+            self.log("▸ 请在图上点击一个点(可放大)")
+        elif self._xytest_state == 'picking':
+            if self._xytest_px is None:
+                self.log("⚠ 请先在图上点击一个点")
+                return
+            u, v = self._xytest_px
+            xy = self.pixel_to_machine(u, v)
+            if xy is None:
+                self.log("⚠ 未标定, 无法换算")
+                return
+            self._xytest_xy = xy
+            self._lbl_xytest.setText(f"XY: {xy[0]:.1f}, {xy[1]:.1f}")
+            self.log(f"▸ 锁定 像素({u},{v}) → 机床XY({xy[0]:.1f},{xy[1]:.1f}), 按GO移动")
+            self._xytest_state = 'idle'
+            self._btn_xytest_pick.setText("选点")
+
+    def _xytest_redraw(self):
+        """在冻结顶图上画选中像素点(picking绿/已锁定红)+换算坐标, 显示到左侧。"""
+        if self._xytest_frame is None or self._xytest_px is None:
+            return
+        vis = self._xytest_frame.copy()
+        u, v = self._xytest_px
+        col = (0, 0, 255) if self._xytest_state == 'idle' else (0, 200, 0)
+        cv2.drawMarker(vis, (int(u), int(v)), col, cv2.MARKER_CROSS, 40, 3)
+        self.display_frame(vis)
+
+    def _xytest_go(self):
+        """移动到换算出的XY(仅XY, 复用0x01, 不动Z)。"""
+        if self._xytest_xy is None:
+            self.log("⚠ 请先选点并锁定再GO")
+            return
+        x, y = self._xytest_xy
+        x = max(0.0, min(2475.0, x))
+        y = max(0.0, min(2475.0, y))
+        self._current_x, self._current_y = x, y
+        self._update_coord_display()
+        self._set_motion_state("moving")
+        self.log(f"▸ XY测试移动 → X={x:.1f} Y={y:.1f} (Z不动)")
+        self._send_cmd(0x01, x, y)
+        self._homed = False
 
     def _ensure_aoi_dir(self):
         """确保AOI图片存储目录可用：优先SD卡，fallback到本地"""
@@ -1103,6 +1591,25 @@ class MainWindow(QMainWindow):
 
     def _on_image_clicked(self, x_ratio, y_ratio):
         """图像区域被点击（坐标为相对于图像的0~1比例）"""
+        # XY标定选点: picking状态下点击设候选绿点
+        if self._xy_calib_active and self._xy_calib_state == 'picking' and self._xy_calib_frame is not None:
+            h, w = self._xy_calib_frame.shape[:2]
+            u, v = int(x_ratio * w), int(y_ratio * h)
+            self._xy_calib_cur_px = (u, v)
+            self.btn_calib_lock.setEnabled(True)
+            self.log(f"▸ 候选点 像素=({u},{v}), 按[锁定点]确认")
+            self._xy_calib_redraw()
+            self._xy_calib_update_status()
+            return
+        # XY测试选点: picking状态下点击设选中像素点
+        if self._xytest_state == 'picking' and self._xytest_frame is not None:
+            h, w = self._xytest_frame.shape[:2]
+            u, v = int(x_ratio * w), int(y_ratio * h)
+            self._xytest_px = (u, v)
+            self._lbl_xytest.setText(f"像素:({u},{v}) 按锁定")
+            self.log(f"▸ XY测试候选 像素=({u},{v}), 按[锁定点]换算")
+            self._xytest_redraw()
+            return
         if not self._edit_mode or not self.current_detections:
             return
         # 将比例坐标转为原图像素坐标
@@ -1396,8 +1903,9 @@ class MainWindow(QMainWindow):
         self._dbg_status_led = QLabel("⚪")
         self._dbg_status_led.setStyleSheet(f"font-size: {S(18)}px;")
         self._dbg_status_txt = QLabel("未连接")
-        self._dbg_status_txt.setStyleSheet(f"font-size: {S(11)}px; font-weight: bold;")
+        self._dbg_status_txt.setStyleSheet(f"font-size: {S(15)}px; font-weight: bold;")
         status_lay.addWidget(self._dbg_status_led)
+        status_lay.addStretch()
         status_lay.addWidget(self._dbg_status_txt)
         status_lay.addStretch()
         left_col.addWidget(status_grp)
@@ -1405,19 +1913,25 @@ class MainWindow(QMainWindow):
         # 实时坐标
         coord_grp = QGroupBox("实时坐标")
         coord_lay = QHBoxLayout(coord_grp)
+        coord_lay.setContentsMargins(S(10), S(10), S(10), S(10))
         self._lbl_coord_x = QLabel("X: 0.0")
         self._lbl_coord_y = QLabel("Y: 0.0")
         self._lbl_coord_z = QLabel("Z: --")
-        for lbl in (self._lbl_coord_x, self._lbl_coord_y, self._lbl_coord_z):
-            lbl.setStyleSheet(f"font-size: {S(11)}px; font-weight: bold; font-family: monospace;")
+        coord_colors = {self._lbl_coord_x: "#ff3b30",   # X 红
+                        self._lbl_coord_y: "#34c759",   # Y 绿
+                        self._lbl_coord_z: "#007aff"}   # Z 蓝
+        for lbl, col in coord_colors.items():
+            lbl.setStyleSheet(f"font-size: {S(15)}px; font-weight: bold; font-family: monospace; color: {col};")
             coord_lay.addWidget(lbl)
+        coord_grp.setMinimumHeight(S(62))
         left_col.addWidget(coord_grp)
         
-        # XY方向控制
+        # XY方向控制(紧凑)
         xy_grp = QGroupBox("XY 移动")
         xy_grid = QGridLayout(xy_grp)
-        xy_grid.setSpacing(S(10))
-        btn_style = f"font-size: {S(16)}px; min-height: {S(50)}px; min-width: {S(50)}px; border-radius: {S(8)}px; background: #e5e5ea;"
+        xy_grid.setSpacing(S(4))
+        xy_grid.setContentsMargins(S(6), S(4), S(6), S(4))
+        btn_style = f"font-size: {S(14)}px; min-height: {S(34)}px; max-height: {S(34)}px; min-width: {S(34)}px; border-radius: {S(6)}px; background: #e5e5ea;"
         btn_up = QPushButton("▲")
         btn_down = QPushButton("▼")
         btn_left = QPushButton("◀")
@@ -1428,10 +1942,10 @@ class MainWindow(QMainWindow):
         xy_grid.addWidget(btn_left, 1, 0)
         xy_grid.addWidget(btn_right, 1, 2)
         xy_grid.addWidget(btn_down, 2, 1)
-        btn_up.clicked.connect(lambda: self._cmd_xy_move(0, 1))
-        btn_down.clicked.connect(lambda: self._cmd_xy_move(0, -1))
-        btn_left.clicked.connect(lambda: self._cmd_xy_move(-1, 0))
-        btn_right.clicked.connect(lambda: self._cmd_xy_move(1, 0))
+        btn_up.clicked.connect(lambda: self._cmd_xy_move(1, 0))
+        btn_down.clicked.connect(lambda: self._cmd_xy_move(-1, 0))
+        btn_left.clicked.connect(lambda: self._cmd_xy_move(0, 1))
+        btn_right.clicked.connect(lambda: self._cmd_xy_move(0, -1))
         left_col.addWidget(xy_grp)
         
         # Z轴控制
@@ -1447,19 +1961,22 @@ class MainWindow(QMainWindow):
         z_lay.addWidget(btn_z_down)
         left_col.addWidget(z_grp)
         
-        # 步进量选择
-        step_grp = QGroupBox("步进量 (mm)")
-        step_lay = QHBoxLayout(step_grp)
+        # 步进量选择 (2x4 八档)
+        step_grp = QGroupBox("步进量 (°)")
+        step_grid = QGridLayout(step_grp)
+        step_grid.setSpacing(S(4))
+        step_grid.setContentsMargins(S(6), S(4), S(6), S(4))
         self._step_btns = []
-        for val in [1, 5, 10, 50]:
+        step_vals = [1, 5, 10, 50, 100, 200, 500, 1000]
+        for idx, val in enumerate(step_vals):
             b = QPushButton(str(val))
             b.setCheckable(True)
-            b.setStyleSheet(f"font-size: {S(11)}px; min-height: {S(30)}px; border-radius: {S(6)}px;")
+            b.setStyleSheet(f"font-size: {S(12)}px; font-weight: bold; min-height: {S(30)}px; border-radius: {S(6)}px;")
             b.clicked.connect(lambda checked, v=val: self._set_step_size(v))
-            step_lay.addWidget(b)
+            step_grid.addWidget(b, idx // 4, idx % 4)
             self._step_btns.append((b, val))
-        self._step_btns[1][0].setChecked(True)
-        self._step_size = 5.0
+        self._step_btns[3][0].setChecked(True)  # 默认选中 50
+        self._step_size = 50.0
         left_col.addWidget(step_grp)
         
         left_col.addStretch()
@@ -1472,12 +1989,17 @@ class MainWindow(QMainWindow):
         # 目标坐标输入
         goto_grp = QGroupBox("运动到坐标")
         goto_lay = QHBoxLayout(goto_grp)
-        self._input_x = QLineEdit("0.0")
-        self._input_y = QLineEdit("0.0")
-        self._input_x.setFixedWidth(S(55))
-        self._input_y.setFixedWidth(S(55))
+        self._input_x = QLineEdit("0")
+        self._input_y = QLineEdit("0")
+        self._input_z = QLineEdit("0")
+        self._input_x.setFixedWidth(S(48))
+        self._input_y.setFixedWidth(S(48))
+        self._input_z.setFixedWidth(S(48))
+        for ed in (self._input_x, self._input_y, self._input_z):
+            ed.setAlignment(Qt.AlignCenter)
         self._input_x.setStyleSheet(f"font-size: {S(11)}px;")
         self._input_y.setStyleSheet(f"font-size: {S(11)}px;")
+        self._input_z.setStyleSheet(f"font-size: {S(11)}px;")
         btn_goto = QPushButton("Go")
         btn_goto.setStyleSheet(f"font-size: {S(11)}px; min-height: {S(32)}px; background: #007aff; color: white; border: none; border-radius: {S(8)}px; padding: 0 {S(10)}px;")
         btn_goto.clicked.connect(self._cmd_goto_xy)
@@ -1485,35 +2007,68 @@ class MainWindow(QMainWindow):
         goto_lay.addWidget(self._input_x)
         goto_lay.addWidget(QLabel("Y:"))
         goto_lay.addWidget(self._input_y)
+        goto_lay.addWidget(QLabel("Z:"))
+        goto_lay.addWidget(self._input_z)
         goto_lay.addWidget(btn_goto)
         right_col.addWidget(goto_grp)
+
+        # XY测试: 验证标定准不准. 左侧显示换算的机床XY, 右侧[选点/锁定点]+[GO](只动XY,不动Z)
+        xytest_grp = QGroupBox("XY测试 (验证标定)")
+        xytest_lay = QHBoxLayout(xytest_grp)
+        xytest_lay.setSpacing(S(6))
+        self._lbl_xytest = QLabel("XY: --")
+        self._lbl_xytest.setStyleSheet(f"font-size: {S(12)}px; font-weight: bold; color: #5856d6;")
+        self._btn_xytest_pick = QPushButton("选点")
+        self._btn_xytest_pick.setFixedHeight(S(32))
+        self._btn_xytest_pick.setStyleSheet(f"font-size: {S(11)}px; background: #34c759; color: white; border: none; border-radius: {S(6)}px;")
+        self._btn_xytest_pick.clicked.connect(self._xytest_pick_toggle)
+        self._btn_xytest_go = QPushButton("GO")
+        self._btn_xytest_go.setFixedHeight(S(32))
+        self._btn_xytest_go.setStyleSheet(f"font-size: {S(11)}px; background: #007aff; color: white; border: none; border-radius: {S(6)}px;")
+        self._btn_xytest_go.clicked.connect(self._xytest_go)
+        xytest_lay.addWidget(self._lbl_xytest, 1)
+        xytest_lay.addWidget(self._btn_xytest_pick, 1)
+        xytest_lay.addWidget(self._btn_xytest_go, 1)
+        right_col.addWidget(xytest_grp)
         
-        # 操作按钮
+        # 操作按钮: 左侧回零/挤锡上下叠放, 右侧急停单独加大(更易触发)
         action_grp = QGroupBox("操作")
-        action_lay = QVBoxLayout(action_grp)
+        action_lay = QHBoxLayout(action_grp)
+        action_lay.setSpacing(S(8))
+        # 左列: 回零 + 挤锡
+        left_btns = QVBoxLayout()
+        left_btns.setSpacing(S(8))
         btn_home = QPushButton("🏠 回零")
         btn_home.setFixedHeight(S(40))
         btn_home.setStyleSheet(f"font-size: {S(11)}px; background: #34c759; color: white; border: none; border-radius: {S(8)}px;")
         btn_home.clicked.connect(self._cmd_home)
-        btn_estop = QPushButton("🛑 急停")
-        btn_estop.setFixedHeight(S(40))
-        btn_estop.setStyleSheet(f"font-size: {S(11)}px; background: #ff3b30; color: white; border: none; border-radius: {S(8)}px;")
-        btn_estop.clicked.connect(self._cmd_estop)
         btn_squeeze = QPushButton("💧 挤锡")
         btn_squeeze.setFixedHeight(S(40))
         btn_squeeze.setStyleSheet(f"font-size: {S(11)}px; background: #ff9500; color: white; border: none; border-radius: {S(8)}px;")
         btn_squeeze.clicked.connect(self._cmd_squeeze)
-        action_lay.addWidget(btn_home)
-        action_lay.addWidget(btn_estop)
-        action_lay.addWidget(btn_squeeze)
+        left_btns.addWidget(btn_home)
+        left_btns.addWidget(btn_squeeze)
+        action_lay.addLayout(left_btns, 1)
+        # 右列: 急停(加大, 占满整高)
+        btn_estop = QPushButton("🛑\n急停")
+        btn_estop.setMinimumHeight(S(88))
+        btn_estop.setStyleSheet(f"font-size: {S(16)}px; font-weight: bold; background: #ff3b30; color: white; border: none; border-radius: {S(10)}px;")
+        btn_estop.clicked.connect(self._cmd_estop)
+        action_lay.addWidget(btn_estop, 1)
         right_col.addWidget(action_grp)
         
-        # 激光测距
-        laser_grp = QGroupBox("激光测距")
+        # 激光测距(左半) + 绝对零点校准(右半)
+        laser_grp = QGroupBox("激光测距 / 零点校准")
         laser_lay = QHBoxLayout(laser_grp)
+        laser_lay.setSpacing(S(8))
         self._lbl_laser = QLabel("距离: -- mm")
         self._lbl_laser.setStyleSheet(f"font-size: {S(12)}px; font-weight: bold;")
-        laser_lay.addWidget(self._lbl_laser)
+        laser_lay.addWidget(self._lbl_laser, 1)
+        self._btn_calib = QPushButton("绝对零点校准")
+        self._btn_calib.setStyleSheet(f"font-size: {S(11)}px; min-height: {S(36)}px; background: #5856d6; color: white; border: none; border-radius: {S(8)}px;")
+        self._btn_calib.setEnabled(True)
+        self._btn_calib.clicked.connect(self._cmd_calib_zero)
+        laser_lay.addWidget(self._btn_calib, 1)
         right_col.addWidget(laser_grp)
         
         # 日志占位(调试模式时log_group移到这里)
@@ -1529,7 +2084,7 @@ class MainWindow(QMainWindow):
         self._step_size = float(val)
         for btn, v in self._step_btns:
             btn.setChecked(v == val)
-        self.log(f"步进量: {val} mm")
+        self.log(f"⚙ 步进量设为 {val}°")
 
     def _cmd_xy_move(self, dx_sign, dy_sign):
         """XY方向移动(框架stub)
@@ -1538,14 +2093,15 @@ class MainWindow(QMainWindow):
             dy_sign: -1/0/1 表示Y方向
         TODO: 实际发送 0x01 帧(绝对坐标) 到STM32
         """
-        dx = dx_sign * self._step_size
+        dx = dx_sign * self._step_size  # 单位°
         dy = dy_sign * self._step_size
-        self._current_x = max(0.0, min(247.5, self._current_x + dx))
-        self._current_y = max(0.0, min(247.5, self._current_y + dy))
+        self._current_x = max(0.0, min(2475.0, self._current_x + dx))
+        self._current_y = max(0.0, min(2475.0, self._current_y + dy))
         self._update_coord_display()
         self._set_motion_state("moving")
-        self.log(f"XY移动 → X={self._current_x:.1f} Y={self._current_y:.1f} mm")
+        self.log(f"▸ XY移动 → X={self._current_x:.1f} Y={self._current_y:.1f}°")
         self._send_cmd(0x01, self._current_x, self._current_y)
+        self._homed = False   # 移动后已离开零点, 需重新回零才能再校准
 
     def _cmd_z_move(self, direction):
         """Z轴步进移动(框架stub)
@@ -1553,10 +2109,19 @@ class MainWindow(QMainWindow):
             direction: 1=上, -1=下
         TODO: 实际发送 0x06 帧(Z步数) 到STM32
         """
-        steps = int(direction * self._step_size * 10)  # 0.1mm单位
+        # direction: 1=上(Z减小), -1=下(Z增大). Z向下为正方向, 范围[0,950]
+        delta = int(-direction * self._step_size)  # 下=正
+        target = max(0, min(950, self._current_z + delta))
+        actual = target - self._current_z
+        if actual == 0:
+            self.log("⚠ Z轴已到限位")
+            return
+        self._current_z = target
+        self._update_coord_display()
         self._set_motion_state("moving")
-        self.log(f"Z轴 {'上' if direction>0 else '下'} {self._step_size}mm ({steps}步)")
-        self._send_cmd(0x06, steps)
+        self.log(f"▸ Z轴{'下' if actual>0 else '上'} {abs(actual)}° (当前{target}°)")
+        self._send_cmd(0x06, actual)
+        self._homed = False   # 移动后已离开零点, 需重新回零才能再校准
 
     def _popup_numpad(self, line_edit, title):
         """点击输入框弹出自定义数字键盘"""
@@ -1568,20 +2133,22 @@ class MainWindow(QMainWindow):
             line_edit.setText(dlg.get_value())
 
     def _cmd_goto_xy(self):
-        """运动到指定XY坐标(框架stub)
-        TODO: 解析输入框数值，发送0x01帧
+        """运动到指定XYZ坐标: 三轴联动(单帧0x08), 同时启动避免分帧被门控拒绝。
+        XY为绝对坐标(0.1mm), Z发送相对当前的步进增量(与move_z步数语义一致)。
         """
         try:
-            tx = float(self._input_x.text())
-            ty = float(self._input_y.text())
-            tx = max(0.0, min(247.5, tx))
-            ty = max(0.0, min(247.5, ty))
+            tx = max(0.0, min(2475.0, float(self._input_x.text())))
+            ty = max(0.0, min(2475.0, float(self._input_y.text())))
+            tz = max(0.0, min(950.0, float(self._input_z.text())))
+            dz = tz - self._current_z
             self._current_x = tx
             self._current_y = ty
+            self._current_z = tz
             self._update_coord_display()
             self._set_motion_state("moving")
-            self.log(f"运动到 X={tx:.1f} Y={ty:.1f} mm")
-            self._send_cmd(0x01, tx, ty)
+            self.log(f"▸ 运动到 X={tx:.1f} Y={ty:.1f} Z={tz:.1f}°")
+            self._send_cmd(0x08, tx, ty, int(dz))
+            self._homed = False   # 移动后已离开零点, 需重新回零才能再校准
         except ValueError:
             self.log("⚠ 坐标输入无效")
 
@@ -1591,17 +2158,35 @@ class MainWindow(QMainWindow):
         """
         self._current_x = 0.0
         self._current_y = 0.0
+        self._current_z = 0
         self._update_coord_display()
         self._set_motion_state("moving")
-        self.log("回零指令")
+        self.log("▸ 回零 (XY+Z)")
         self._send_cmd(0x03)
+        # 回零后状态干净, 允许绝对零点校准(防止未回零误触乱套)
+        self._homed = True
+
+    def _cmd_calib_zero(self):
+        """绝对零点校准: 将当前物理位置标定为工作坐标(-360,-360)。
+        前提: 已手动将电机调到绝对零点并回过零。坐标由STM32重算后上报刷新。
+        防误触: 单次上电仅允许校准一次。
+        """
+        if getattr(self, '_calibrated', False):
+            self.log("⚠ 本次上电已校准过, 如需重新校准请重启系统")
+            return
+        if not getattr(self, '_homed', False):
+            self.log("⚠ 请先回零再执行绝对零点校准")
+            return
+        self.log("▸ 绝对零点校准 → 标定当前位置为 (-254.56, -254.56)")
+        self._send_cmd(0x09)
+        self._calibrated = True
 
     def _cmd_estop(self):
         """急停(框架stub)
         TODO: 发送0x02帧
         """
         self._set_motion_state("estop")
-        self.log("🛑 急停！")
+        self.log("🛑 急停")
         self._send_cmd(0x02)
 
     def _cmd_squeeze(self):
@@ -1616,11 +2201,34 @@ class MainWindow(QMainWindow):
         if self.infer_thread is not None:
             self.infer_thread.conf_thresh = float(val)
 
+    def _poll_motor_state(self):
+        """主线程轮询motor真实坐标/状态(线程安全),更新调试显示。"""
+        if not self._motor:
+            return
+        try:
+            x, y = self._motor.get_position()
+            z = self._motor.get_z() if hasattr(self._motor, 'get_z') else self._current_z
+            st = self._motor.get_state()
+        except Exception:
+            return
+        # 同步逻辑坐标(以STM32上报为准)
+        self._current_x, self._current_y, self._current_z = x, y, z
+        if self.current_mode == "debug":
+            self._update_coord_display()
+            if hasattr(self, '_lbl_laser'):
+                try:
+                    self._lbl_laser.setText(f"距离: {self._motor.get_laser()} mm")
+                except Exception:
+                    pass
+            self._set_motion_state({0: "idle", 1: "moving", 2: "estop"}.get(st, "idle"))
+
     def _update_coord_display(self):
         """更新调试面板的XYZ坐标显示"""
         if hasattr(self, '_lbl_coord_x'):
             self._lbl_coord_x.setText(f"X: {self._current_x:.1f}")
             self._lbl_coord_y.setText(f"Y: {self._current_y:.1f}")
+            if hasattr(self, '_lbl_coord_z'):
+                self._lbl_coord_z.setText(f"Z: {self._current_z:.1f}")
 
     def _set_motion_state(self, state):
         """更新运动状态指示灯
@@ -1646,7 +2254,7 @@ class MainWindow(QMainWindow):
         """
         # 通过motor_control发送(已封装,见motor_control.py)
         if self._motor is None:
-            self.log(f"[send_cmd] 无motor id=0x{cmd_id:02X} args={args}")
+            self.log(f"⚠ 运动控制器未连接 (id=0x{cmd_id:02X})")
             return
         # cmd_id分派到motor接口
         try:
@@ -1655,8 +2263,10 @@ class MainWindow(QMainWindow):
             elif cmd_id == 0x03: self._motor.home()
             elif cmd_id == 0x06: self._motor.move_z(args[0])
             elif cmd_id == 0x07: self._motor.squeeze(args[0] if args else 1)
+            elif cmd_id == 0x08: self._motor.move_xyz(args[0], args[1], args[2])
+            elif cmd_id == 0x09: self._motor.calibrate_zero()
         except Exception as e:
-            self.log(f"send_cmd出错: {e}")
+            self.log(f"✗ 指令发送出错: {e}")
 
 
 
@@ -1664,6 +2274,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭事件：停止推理线程，释放资源"""
+        self._stop_tip_preview()
         self.stop_camera()
         event.accept()
 
