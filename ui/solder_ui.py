@@ -493,6 +493,7 @@ class IOSStepper(QWidget):
 class InferenceThread(QThread):
     """YOLO推理线程"""
     result_ready = pyqtSignal(object, list, float)  # frame, detections, elapsed_ms
+    remote_error = pyqtSignal(str)  # 远程推理单帧失败时发出错误信息
 
     def __init__(self, model_path):
         """初始化推理线程：指定RKNN模型路径"""
@@ -504,6 +505,8 @@ class InferenceThread(QThread):
         self.rknn = None
         self.mode = 'camera'
         self.cam_id = None
+        self.use_remote = False       # True则走外部网口推理
+        self.remote_client = None     # RemoteInferClient实例
 
     def init_model(self):
         """加载RKNN模型到NPU"""
@@ -556,10 +559,21 @@ class InferenceThread(QThread):
             y1_crop = cy - crop_size // 2
             infer_crop = frame[y1_crop:y1_crop+crop_size, x1_crop:x1_crop+crop_size]
 
-            bboxes, scores, class_ids = infer(self.rknn, infer_crop, conf_thresh=self.conf_thresh)
+            try:
+                if self.use_remote and self.remote_client is not None:
+                    bboxes, scores, class_ids = self.remote_client.infer(
+                        infer_crop, conf_thresh=self.conf_thresh)
+                else:
+                    bboxes, scores, class_ids = infer(
+                        self.rknn, infer_crop, conf_thresh=self.conf_thresh)
+            except Exception as e:
+                # 远程单帧失败: 报警并跳过本帧, 保持外部模式等下一帧重试
+                if self.use_remote:
+                    self.remote_error.emit(str(e))
+                    time.sleep(0.05)
+                    continue
+                raise
             elapsed = (time.time() - t0) * 1000
-
-            # bboxes在ROI(1080)坐标系 → 偏移到原图坐标
             if len(bboxes) > 0:
                 bboxes[:, [0, 2]] += x1_crop
                 bboxes[:, [1, 3]] += y1_crop
@@ -637,6 +651,33 @@ class CameraPreviewThread(QThread):
         self.wait()
 
 
+class HealthCheckThread(QThread):
+    """后台推理系统健康探测线程(避免在GUI主线程做阻塞网络请求导致卡顿)"""
+    status_changed = pyqtSignal(bool)  # 仅在在线状态变化时发出
+    status_tick = pyqtSignal(bool)     # 每次探测结果(用于掉线时持续触发回退)
+
+    def __init__(self, client, interval=1.0):
+        super().__init__()
+        self.client = client
+        self.interval = interval
+        self.running = False
+        self._last = None
+
+    def run(self):
+        self.running = True
+        while self.running:
+            online = self.client.check_health()
+            self.status_tick.emit(online)
+            if online != self._last:
+                self._last = online
+                self.status_changed.emit(online)
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
 # ============================================================
 # 主窗口
 # ============================================================
@@ -676,6 +717,17 @@ class MainWindow(QMainWindow):
         self._motor_poll_timer.start(200)
 
         self._scale = screen.width() / 1024.0
+
+        # 外部网口推理 (Win11推理服务)
+        self._use_remote = False          # 当前是否使用外部推理
+        self._remote_online = False       # 推理系统在线状态(health轮询结果)
+        from remote_infer import RemoteInferClient
+        self._remote_client = RemoteInferClient("http://192.168.137.222:8000")
+        # health探测放后台线程(避免阻塞GUI主线程导致渲染/缩放卡顿)
+        self._health_thread = HealthCheckThread(self._remote_client, interval=1.0)
+        self._health_thread.status_changed.connect(self._on_remote_status_changed)
+        self._health_thread.status_tick.connect(self._on_remote_status_tick)
+        self._health_thread.start()
 
         # 状态
         self.current_mode = "solder"
@@ -851,6 +903,9 @@ class MainWindow(QMainWindow):
         self.lbl_motor = QLabel("执行系统: --")
         self.lbl_motor.setStyleSheet(f"color: #8e8e93; font-weight: 600;")
         status_inner.addWidget(self.lbl_motor)
+        self.lbl_infersys = QLabel("推理系统: 离线")
+        self.lbl_infersys.setStyleSheet(f"color: #8e8e93; font-weight: 600;")
+        status_inner.addWidget(self.lbl_infersys)
         left_layout.addWidget(status_widget)
 
         main_layout.addLayout(left_layout, 1)
@@ -936,8 +991,19 @@ class MainWindow(QMainWindow):
             if self._scan_cameras() is not False:
                 _orig_popup()
         self.combo_cam.showPopup = _custom_popup
-        self.combo_cam.setFixedSize(S(114), S(30))
-        param_layout.addLayout(make_row("摄像头:", self.combo_cam))
+        self.combo_cam.setFixedSize(S(70), S(30))
+        # 摄像头行: 左标签+压缩的combo + 右侧"推理切换"按钮(本地/外部, 共用全局状态)
+        cam_row = QHBoxLayout()
+        cam_lbl = QLabel("摄像头:")
+        cam_lbl.setFixedWidth(S(80))
+        cam_row.addWidget(cam_lbl)
+        cam_row.addWidget(self.combo_cam)
+        cam_row.addStretch()
+        self.btn_infer_src = QPushButton("本地推理")
+        self.btn_infer_src.setFixedSize(S(100), S(30))
+        self.btn_infer_src.clicked.connect(self._toggle_infer_source)
+        cam_row.addWidget(self.btn_infer_src)
+        param_layout.addLayout(cam_row)
 
         right_layout.addWidget(param_group)
 
@@ -1528,7 +1594,10 @@ class MainWindow(QMainWindow):
         # 验证通过，启动推理线程
         self.infer_thread = InferenceThread(self._current_model_path())
         self.infer_thread.conf_thresh = float(self.spin_conf.value())
+        self.infer_thread.use_remote = self._use_remote
+        self.infer_thread.remote_client = self._remote_client
         self.infer_thread.result_ready.connect(self.on_result)
+        self.infer_thread.remote_error.connect(lambda m: self.log(f"⚠ 外部推理失败: {m}"))
         self.infer_thread.set_camera(cam_id)
         self.infer_thread.start()
         self._frozen = False
@@ -1559,7 +1628,7 @@ class MainWindow(QMainWindow):
         if self.current_mode == 'solder' and self.current_detections:
             # 仅首次进入编辑模式时初始化为全选；已在编辑模式则保留之前的选中状态
             if not self._edit_mode or len(self._selection_mask) != len(self.current_detections):
-                self._selection_mask = [int(d[2]) == 1 for d in self.current_detections]  # 默认只选pad(class=1),hole/qfn不选
+                self._selection_mask = [int(d[2]) == 0 for d in self.current_detections]  # 默认只选pad(class=0),hole/qfn不选
             self._edit_mode = True
             self._redraw_edit_frame()
             self.log("◎ 编辑模式：点击框可取消/恢复选中")
@@ -1706,33 +1775,88 @@ class MainWindow(QMainWindow):
         else:
             self.execute_aoi()
 
+    def _toggle_infer_source(self):
+        """切换本地/外部推理。外部仅在推理系统在线时可切, 否则报警不切。"""
+        if not self._use_remote:
+            # 本地 → 外部: 需在线
+            if not self._remote_online:
+                self.log("⚠ 推理系统离线, 无法切换到外部推理")
+                return
+            self._use_remote = True
+            self.btn_infer_src.setText("外部推理")
+            self.btn_infer_src.setStyleSheet("background: #ff9500; color: white; font-weight: 600;")
+            self.log("✓ 已切换到外部推理")
+        else:
+            # 外部 → 本地
+            self._use_remote = False
+            self.btn_infer_src.setText("本地推理")
+            self.btn_infer_src.setStyleSheet("")
+            self.log("✓ 已切换到本地推理")
+        # 同步到推理线程
+        if self.infer_thread is not None:
+            self.infer_thread.use_remote = self._use_remote
+            self.infer_thread.remote_client = self._remote_client
+
+    def _on_remote_status_changed(self, online):
+        """推理系统在线状态变化时更新UI(由后台线程信号触发, 运行在主线程)"""
+        self._remote_online = online
+        if online:
+            self.lbl_infersys.setText("推理系统: 在线")
+            self.lbl_infersys.setStyleSheet("color: #34c759; font-weight: 600;")
+        else:
+            self.lbl_infersys.setText("推理系统: 离线")
+            self.lbl_infersys.setStyleSheet("color: #ff3b30; font-weight: 600;")
+
+    def _on_remote_status_tick(self, online):
+        """每次探测结果: 若离线且当前处于外部推理则自动回退本地"""
+        if not online and self._use_remote:
+            self._fallback_local("推理系统掉线")
+
+    def _fallback_local(self, reason=""):
+        """从外部推理自动回退到本地推理。"""
+        self._use_remote = False
+        self.btn_infer_src.setText("本地推理")
+        self.btn_infer_src.setStyleSheet("")
+        if self.infer_thread is not None:
+            self.infer_thread.use_remote = False
+        self.log(f"⚠ {reason}, 已自动切回本地推理")
+
     def _infer_once(self, frame, model_path):
-        """对单帧执行一次RKNN推理(阻塞)，返回(bboxes, scores, class_ids, elapsed_ms)"""
-        from rknnlite.api import RKNNLite
-        from infer import infer
-        rknn = RKNNLite()
-        rknn.load_rknn(model_path)
-        rknn.init_runtime()
+        """对单帧执行一次推理(阻塞)，返回(detections, elapsed_ms)。
+        外部推理模式走远程, 否则本地RKNN。远程失败则报警返回空。"""
         t0 = time.time()
         # frame裁剪中心正方形ROI送推理
         fh, fw = frame.shape[:2]
         side = min(fh, fw)
         rx, ry = (fw - side) // 2, (fh - side) // 2
         roi = frame[ry:ry+side, rx:rx+side]
-        bboxes, scores, class_ids = infer(rknn, roi)
+
+        if self._use_remote and self._remote_client is not None:
+            try:
+                bboxes, scores, class_ids = self._remote_client.infer(roi)
+            except Exception as e:
+                self.log(f"⚠ 外部推理失败: {e}")
+                return [], (time.time() - t0) * 1000
+        else:
+            from rknnlite.api import RKNNLite
+            from infer import infer
+            rknn = RKNNLite()
+            rknn.load_rknn(model_path)
+            rknn.init_runtime()
+            bboxes, scores, class_ids = infer(rknn, roi)
+            try:
+                rknn.release()
+            except Exception:
+                pass
         if len(bboxes) > 0:
             bboxes[:, [0, 2]] += rx
             bboxes[:, [1, 3]] += ry
-        try:
-            rknn.release()
-        except Exception:
-            pass
         elapsed = (time.time() - t0) * 1000
         return list(zip(bboxes, scores, class_ids)) if len(bboxes) > 0 else [], elapsed
 
-    # 类别名与颜色 (0=hole, 1=pad, 2=qfn)
-    CLASS_NAMES = ("hole", "pad", "qfn")
-    CLASS_COLORS = ((0, 165, 255), (0, 255, 0), (255, 128, 0))  # hole橙, pad绿, qfn蓝
+    # 类别名与颜色 (0=pad, 1=hole, 2=qfn)
+    CLASS_NAMES = ("pad", "hole", "qfn")
+    CLASS_COLORS = ((0, 255, 0), (0, 165, 255), (255, 128, 0))  # pad绿, hole橙, qfn蓝
 
     def _draw_detections(self, frame, detections, color=None, prefix=None):
         """在帧上绘制检测框和标签。color/prefix为None时按类别自动着色+真实类别名。"""
@@ -2274,6 +2398,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭事件：停止推理线程，释放资源"""
+        try:
+            if hasattr(self, '_health_thread') and self._health_thread:
+                self._health_thread.stop()
+        except Exception:
+            pass
         self._stop_tip_preview()
         self.stop_camera()
         event.accept()

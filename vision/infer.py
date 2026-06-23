@@ -4,7 +4,7 @@ RKNN YOLOv5 推理模块 (1088输入, 移植自转模型验证代码 test-1088-1
 =====================================================================
 预处理: 输入正方形ROI(1080x1080) → 直接resize到1088x1088 (BGR→RGB)
 后处理: rknn_model_zoo官方yolov5后处理, 按类别分组NMS(不同类不互相抑制)
-类别: 0=hole, 1=pad, 2=qfn
+类别: 0=pad, 1=hole, 2=qfn
 """
 
 import cv2
@@ -16,7 +16,7 @@ MODEL_PATH = '/home/elf/solder_system/models/pad.rknn'
 CONF_THRESH = 0.25      # OBJ_THRESH
 NMS_THRESH = 0.45
 INPUT_SIZE = 1088
-CLASSES = ("hole", "pad", "qfn")
+CLASSES = ("pad", "hole", "qfn")
 ANCHORS = [[10, 13], [16, 30], [33, 23], [30, 61], [62, 45],
            [59, 119], [116, 90], [156, 198], [373, 326]]
 
