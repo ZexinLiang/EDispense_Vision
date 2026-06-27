@@ -49,10 +49,87 @@ OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 CONFIG_DIR = os.path.join(BASE_DIR, 'config')
 XY_CALIB_PATH = os.path.join(CONFIG_DIR, 'xy_calib.json')
 AOI_IMAGE_DIR = '/media/elf/OPI_BOOT/AOI_Picture'
+SOLDER_Z_DOWN_STEPS = 820
+SOLDER_SQUEEZE_COUNT = 1
+SOLDER_STEP_TIMEOUT_MS = 12000
+SOLDER_TIMER_INTERVAL_MS = 50
+SOLDER_XY_MIN_WAIT_MS = 1200
+SOLDER_Z_DOWN_MIN_WAIT_MS = 1800
+SOLDER_SQUEEZE_MIN_WAIT_MS = 500
+SOLDER_Z_UP_MIN_WAIT_MS = 1800
 sys.path.insert(0, os.path.join(BASE_DIR, 'vision'))
 sys.path.insert(0, BASE_DIR)  # motor_control.py在项目根目录
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# 相机畸变矫正 (仅 video21 顶视相机)
+# ============================================================
+UNDISTORT_CAM_ID = 21
+CALIB_NPZ_PATH = os.path.join(CONFIG_DIR, 'calibration_result_4.npz')
+
+
+class _Undistorter:
+    """video21 顶视相机畸变矫正器。
+    懒加载标定参数(mtx/dist), 按分辨率预计算 remap 表, 对每帧整图做 remap。
+    注意: XY标定与点锡像素->机床映射均应基于矫正后的图像, 故更换本标定后必须重新做XY标定。"""
+
+    def __init__(self):
+        self._maps = {}      # (w, h) -> (map1, map2)
+        self._mtx = None
+        self._dist = None
+        self._loaded = False
+        self._ok = False
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            data = np.load(CALIB_NPZ_PATH)
+            self._mtx = data['mtx']
+            self._dist = data['dist']
+            self._ok = True
+            try:
+                err = float(data['reprojection_error'])
+                print(f"[undistort] loaded {CALIB_NPZ_PATH}, reproj_err={err:.4f}")
+            except Exception:
+                print(f"[undistort] loaded {CALIB_NPZ_PATH}")
+        except Exception as e:
+            print(f"[undistort] load failed: {e} -> video21 不做畸变矫正")
+            self._ok = False
+
+    def apply(self, frame):
+        """对整帧BGR做畸变矫正; 标定缺失/加载失败时原样返回。"""
+        if frame is None:
+            return frame
+        self._ensure_loaded()
+        if not self._ok:
+            return frame
+        h, w = frame.shape[:2]
+        key = (w, h)
+        maps = self._maps.get(key)
+        if maps is None:
+            # 用原相机矩阵作为新矩阵, 保持中心尺度不变(边缘可能出现少量黑边)
+            map1, map2 = cv2.initUndistortRectifyMap(
+                self._mtx, self._dist, None, self._mtx, (w, h), cv2.CV_16SC2)
+            maps = (map1, map2)
+            self._maps[key] = maps
+        return cv2.remap(frame, maps[0], maps[1], interpolation=cv2.INTER_LINEAR)
+
+
+_undistorter = _Undistorter()
+
+
+def undistort_cam21(frame, cam_id):
+    """仅当 cam_id == 21 时对帧做畸变矫正, 其余相机原样返回。"""
+    try:
+        if int(cam_id) == UNDISTORT_CAM_ID:
+            return _undistorter.apply(frame)
+    except (ValueError, TypeError):
+        pass
+    return frame
 
 
 # ============================================================
@@ -544,6 +621,8 @@ class InferenceThread(QThread):
                 if not ret:
                     time.sleep(0.01)
                     continue
+                # video21顶视相机畸变矫正(其余相机原样)
+                frame = undistort_cam21(frame, self.cam_id)
             elif self.mode == 'image':
                 frame = self._img.copy()
             else:
@@ -581,6 +660,7 @@ class InferenceThread(QThread):
             # 裁剪显示区域: 中心1640x1080
             disp_w = min(1640, w)
             x1_disp = cx - disp_w // 2
+            self.disp_offset_x = x1_disp  # 记录显示裁剪x偏移, 供路径生成还原全图坐标
             display_frame = frame[0:h, x1_disp:x1_disp+disp_w].copy()
             if len(bboxes) > 0:
                 bboxes[:, [0, 2]] -= x1_disp
@@ -636,6 +716,7 @@ class CameraPreviewThread(QThread):
             if self.cap and self.cap.isOpened():
                 ret, frame = self.cap.read()
                 if ret:
+                    frame = undistort_cam21(frame, self.cam_id)
                     self.frame_ready.emit(frame)
                 else:
                     time.sleep(0.01)
@@ -1279,6 +1360,8 @@ class MainWindow(QMainWindow):
                 if ok:
                     frame = f
             cap.release()
+            # video21顶视相机畸变矫正
+            frame = undistort_cam21(frame, cam_id)
             return frame
         except Exception as e:
             self.log(f"✗ 顶部相机抓帧异常: {e}")
@@ -1734,6 +1817,8 @@ class MainWindow(QMainWindow):
                                    output_json=os.path.join(OUTPUT_DIR, 'path_output.json'),
                                    output_gcode=os.path.join(OUTPUT_DIR, 'path_output.gcode'))
             self.path_result = result
+            # 记录生成路径时的显示裁剪x偏移, 执行时用于把显示坐标还原为全图坐标(与XY标定对齐)
+            self._path_disp_offset_x = getattr(self.infer_thread, 'disp_offset_x', 0) if self.infer_thread else 0
 
             vis_img = visualize_path(frame, result['points'],
                                      os.path.join(OUTPUT_DIR, 'path_visual.jpg'))
@@ -1913,38 +1998,142 @@ class MainWindow(QMainWindow):
             self.btn_execute.setEnabled(True)
 
     def execute_solder(self):
-        """执行点锡动作：将G-code通过串口发送到STM32(TODO)"""
+        """执行点锡动作：XY到点→Z下降固定820步→挤锡→Z回抬820步→下一点。"""
         if self.current_mode != "solder":
             self.execute_aoi()
             return
         if not self.path_result or not self.path_result.get('points'):
             self.log("⚠ 当前无可用路径，请先点击「路径生成」")
             return
+        if self._motor is None or not self._motor.is_online():
+            self.log("⚠ 执行系统离线，无法执行点锡")
+            return
+        if self._xy_calib_M is None:
+            self.log("⚠ 请先完成XY标定，再执行点锡")
+            return
 
-        points = self.path_result['points']
-        total = len(points)
+        exec_points = []
+        for i, pt in enumerate(self.path_result['points']):
+            try:
+                u, v = float(pt['x']), float(pt['y'])
+            except Exception:
+                self.log(f"⚠ 路径点{i}格式错误，跳过: {pt}")
+                continue
+            # 还原显示裁剪x偏移→全图坐标(XY标定基于全图1920坐标)
+            u += getattr(self, '_path_disp_offset_x', 0)
+            xy = self.pixel_to_machine(u, v)
+            if xy is None:
+                self.log("⚠ XY标定无效，无法换算机床坐标")
+                return
+            exec_points.append({"u": u, "v": v, "x": xy[0], "y": xy[1], "raw": pt})
+
+        if not exec_points:
+            self.log("⚠ 无有效点锡点")
+            return
+
+        total = len(exec_points)
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(0)
         self.btn_execute.setEnabled(False)
         self._exec_idx = 0
-        self._exec_points = points
+        self._exec_points = exec_points
+        self._exec_phase = 'xy'
+        self._exec_waiting = False
+        self._exec_cmd_ts = 0.0
+        self._exec_started_at = time.time()
 
         self._exec_timer = QTimer()
         self._exec_timer.timeout.connect(self._exec_step)
-        self._exec_timer.start(50)
-        self.log(f"⚙ 开始执行点锡: {total} 点")
+        self._exec_timer.start(SOLDER_TIMER_INTERVAL_MS)
+        self.log(f"⚙ 开始执行点锡: {total}点，Z下降{SOLDER_Z_DOWN_STEPS}步，挤锡{SOLDER_SQUEEZE_COUNT}次/点")
+
+    def _exec_abort(self, reason):
+        """停止点锡状态机并恢复按钮。"""
+        try:
+            if hasattr(self, '_exec_timer') and self._exec_timer:
+                self._exec_timer.stop()
+        except Exception:
+            pass
+        self.btn_execute.setEnabled(True)
+        self.log(f"✗ 点锡执行中止: {reason}")
+
+    def _exec_motor_busy(self):
+        """读取motor busy状态，兼容旧版motor_control无is_busy。"""
+        try:
+            return bool(self._motor.is_busy())
+        except Exception:
+            return False
+
+    def _exec_min_wait_ms(self, phase):
+        """阶段最小等待时间: 兜底STM32状态上报过早清busy导致命令连发。"""
+        if phase == 'z_down':
+            return SOLDER_XY_MIN_WAIT_MS
+        if phase == 'squeeze':
+            return SOLDER_Z_DOWN_MIN_WAIT_MS
+        if phase == 'z_up':
+            return SOLDER_SQUEEZE_MIN_WAIT_MS
+        if phase == 'xy':
+            return SOLDER_Z_UP_MIN_WAIT_MS
+        return 0
+
+    def _exec_wait_done(self):
+        """若上一条运动/挤锡仍在执行则等待；同时满足阶段最小等待后才发送下一条。"""
+        if not self._exec_waiting:
+            return True
+        elapsed_ms = (time.time() - self._exec_cmd_ts) * 1000
+        if elapsed_ms > SOLDER_STEP_TIMEOUT_MS:
+            self._exec_abort(f"等待{self._exec_phase}完成超时")
+            return False
+        if elapsed_ms < self._exec_min_wait_ms(self._exec_phase):
+            return False
+        if self._exec_motor_busy():
+            return False
+        self._exec_waiting = False
+        return True
+
+    def _exec_send(self, phase, cmd_id, *args):
+        """发送一步执行命令，成功后进入等待busy释放。"""
+        ok = self._send_cmd(cmd_id, *args)
+        if ok is False:
+            self._exec_abort(f"发送{phase}命令失败")
+            return False
+        self._exec_phase = phase
+        self._exec_waiting = True
+        self._exec_cmd_ts = time.time()
+        return True
 
     def _exec_step(self):
-        """点锡执行进度回调：更新进度条，逐步发送G-code指令"""
+        """点锡执行状态机：等待上一条命令完成后发送下一条。"""
+        if self._motor is None or not self._motor.is_online():
+            self._exec_abort("执行系统离线")
+            return
+        if not self._exec_wait_done():
+            return
+
         if self._exec_idx >= len(self._exec_points):
             self._exec_timer.stop()
             self.progress_bar.setValue(self.progress_bar.maximum())
             self.btn_execute.setEnabled(True)
-            self.log("✓ 点锡执行完成")
+            elapsed = time.time() - getattr(self, '_exec_started_at', time.time())
+            self.log(f"✓ 点锡执行完成: {len(self._exec_points)}点，用时{elapsed:.1f}s")
             return
-        # TODO: 实际发送坐标到运动控制器
-        self._exec_idx += 1
-        self.progress_bar.setValue(self._exec_idx)
+
+        pt = self._exec_points[self._exec_idx]
+        phase = getattr(self, '_exec_phase', 'xy')
+
+        if phase == 'xy':
+            self.log(f"▸ 点{self._exec_idx+1}/{len(self._exec_points)} XY→({pt['x']:.1f},{pt['y']:.1f})")
+            self._exec_send('z_down', 0x01, pt['x'], pt['y'])
+        elif phase == 'z_down':
+            self._exec_send('squeeze', 0x06, SOLDER_Z_DOWN_STEPS)
+        elif phase == 'squeeze':
+            self._exec_send('z_up', 0x07, SOLDER_SQUEEZE_COUNT)
+        elif phase == 'z_up':
+            self._exec_send('xy', 0x06, -SOLDER_Z_DOWN_STEPS)
+            self._exec_idx += 1
+            self.progress_bar.setValue(self._exec_idx)
+        else:
+            self._exec_abort(f"未知执行阶段: {phase}")
 
     def on_result(self, frame, detections, elapsed):
         """推理结果回调(InferenceThread信号)：更新状态栏+绘制检测框+显示帧"""
@@ -2379,18 +2568,35 @@ class MainWindow(QMainWindow):
         # 通过motor_control发送(已封装,见motor_control.py)
         if self._motor is None:
             self.log(f"⚠ 运动控制器未连接 (id=0x{cmd_id:02X})")
-            return
+            return False
         # cmd_id分派到motor接口
         try:
-            if cmd_id == 0x01:   self._motor.move_to(args[0], args[1])
-            elif cmd_id == 0x02: self._motor.estop()
-            elif cmd_id == 0x03: self._motor.home()
-            elif cmd_id == 0x06: self._motor.move_z(args[0])
-            elif cmd_id == 0x07: self._motor.squeeze(args[0] if args else 1)
-            elif cmd_id == 0x08: self._motor.move_xyz(args[0], args[1], args[2])
-            elif cmd_id == 0x09: self._motor.calibrate_zero()
+            if cmd_id == 0x01:
+                return bool(self._motor.move_to(args[0], args[1]))
+            elif cmd_id == 0x02:
+                return bool(self._motor.estop())
+            elif cmd_id == 0x03:
+                return bool(self._motor.home())
+            elif cmd_id == 0x06:
+                return bool(self._motor.move_z(args[0]))
+            elif cmd_id == 0x07:
+                return bool(self._motor.squeeze(args[0] if args else 1))
+            elif cmd_id == 0x08:
+                if hasattr(self._motor, 'move_xyz'):
+                    return bool(self._motor.move_xyz(args[0], args[1], args[2]))
+                self.log("⚠ 当前motor_control不支持XYZ联动(0x08)")
+                return False
+            elif cmd_id == 0x09:
+                if hasattr(self._motor, 'calibrate_zero'):
+                    return bool(self._motor.calibrate_zero())
+                self.log("⚠ 当前motor_control不支持绝对零点校准(0x09)")
+                return False
+            else:
+                self.log(f"⚠ 未知指令 id=0x{cmd_id:02X}")
+                return False
         except Exception as e:
             self.log(f"✗ 指令发送出错: {e}")
+            return False
 
 
 

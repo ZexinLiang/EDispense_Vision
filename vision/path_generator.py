@@ -53,17 +53,20 @@ def generate_dispense_points(bboxes, scores, class_ids):
         class_ids: [int, ...]
     
     Returns:
-        list of dict: [{"x": px, "y": py, "type": "single"/"fill", "class": id, "dwell": ms}, ...]
+        list of dict: [{"x":px,"y":py,"type":"single"/"fill","class":id,"dwell":ms,
+                        "pad":焊盘索引,"pad_cx":焊盘中心x,"pad_cy":焊盘中心y}, ...]
     """
     all_points = []
     
-    for bbox, score, cls_id in zip(bboxes, scores, class_ids):
+    for pad_idx, (bbox, score, cls_id) in enumerate(zip(bboxes, scores, class_ids)):
         x1, y1, x2, y2 = bbox
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
         h = y2 - y1
         area = w * h
+        pad_meta = {"pad": pad_idx, "pad_cx": float(cx), "pad_cy": float(cy),
+                    "pad_w": float(w), "pad_h": float(h)}
         
         if area >= LARGE_PAD_AREA:
             # 大焊盘：网格填充
@@ -81,14 +84,16 @@ def generate_dispense_points(bboxes, scores, class_ids):
                     all_points.append({
                         "x": float(x), "y": float(y),
                         "type": "fill", "class": int(cls_id),
-                        "score": float(score), "dwell": DWELL_TIME_MS
+                        "score": float(score), "dwell": DWELL_TIME_MS,
+                        **pad_meta
                     })
         else:
             # 小焊盘：中心单点
             all_points.append({
                 "x": float(cx), "y": float(cy),
                 "type": "single", "class": int(cls_id),
-                "score": float(score), "dwell": DWELL_TIME_MS
+                "score": float(score), "dwell": DWELL_TIME_MS,
+                **pad_meta
             })
     
     return all_points
@@ -96,25 +101,78 @@ def generate_dispense_points(bboxes, scores, class_ids):
 
 def optimize_path(points):
     """
-    贪心最近邻路径优化
-    从左上角(0,0)出发，每次走最近未访问点
+    路径排序：按焊盘分组，焊盘间做行带蛇形扫描(逐行往返),焊盘内点保持原顺序。
+    避免全局最近邻把同一焊盘的点打散导致喷头在焊盘间反复横跳。
     """
     if len(points) <= 1:
         return points
-    
-    remaining = list(range(len(points)))
+
+    # 1. 按焊盘分组(保持组内原顺序)
+    groups = {}
+    order = []
+    for p in points:
+        pid = p.get("pad", 0)
+        if pid not in groups:
+            groups[pid] = []
+            order.append(pid)
+        groups[pid].append(p)
+
+    # 2. 每个焊盘取中心代表点 + 焊盘高度
+    pads = []
+    for pid in order:
+        g = groups[pid]
+        cx = g[0].get("pad_cx", float(np.mean([q["x"] for q in g])))
+        cy = g[0].get("pad_cy", float(np.mean([q["y"] for q in g])))
+        ph = g[0].get("pad_h", 0.0)
+        pads.append({"pid": pid, "cx": cx, "cy": cy, "h": ph})
+
+    if len(pads) == 1:
+        return groups[pads[0]["pid"]]
+
+    # 3. 按y排序后聚类成行: 与当前行基准y之差超过阈值(约半个焊盘高度,兜底用中位y间距)即换行
+    pads_by_y = sorted(pads, key=lambda d: d["cy"])
+    med_h = float(np.median([d["h"] for d in pads_by_y if d["h"] > 0])) if any(d["h"] > 0 for d in pads_by_y) else 0.0
+    if med_h <= 0:
+        ys = [d["cy"] for d in pads_by_y]
+        diffs = [b - a for a, b in zip(ys, ys[1:]) if b - a > 1e-3]
+        med_h = float(np.median(diffs)) if diffs else 1.0
+    row_tol = max(med_h * 0.6, 1.0)
+
+    rows = []
+    cur_row = [pads_by_y[0]]
+    row_ref_y = pads_by_y[0]["cy"]
+    for d in pads_by_y[1:]:
+        if d["cy"] - row_ref_y <= row_tol:
+            cur_row.append(d)
+        else:
+            rows.append(cur_row)
+            cur_row = [d]
+        row_ref_y = d["cy"]  # 用上一个点的y做滚动基准,适应整体倾斜
+
+    rows.append(cur_row)
+
+    # 4. 逐行往返(蛇形): 行内按x排序,奇数行反向
+    ordered_pads = []
+    for ri, row in enumerate(rows):
+        row_sorted = sorted(row, key=lambda d: d["cx"])
+        if ri % 2 == 1:
+            row_sorted = row_sorted[::-1]
+        ordered_pads.extend(row_sorted)
+
+    # 5. 按排好的焊盘顺序拼接各组的点; 每进入一个焊盘, 若其末端离上一结束点更近则整体翻转,
+    #    使焊盘间衔接走最近端, 消除焊盘内填充序列方向不一致导致的斜向回跳。
     ordered = []
-    
-    # 起点：离(0,0)最近的点
-    current = np.array([0.0, 0.0])
-    
-    while remaining:
-        dists = [np.hypot(points[i]["x"] - current[0], points[i]["y"] - current[1]) for i in remaining]
-        nearest_idx = np.argmin(dists)
-        chosen = remaining.pop(nearest_idx)
-        ordered.append(points[chosen])
-        current = np.array([points[chosen]["x"], points[chosen]["y"]])
-    
+    last = None
+    for d in ordered_pads:
+        g = groups[d["pid"]]
+        if last is not None and len(g) > 1:
+            d0 = (g[0]["x"] - last["x"]) ** 2 + (g[0]["y"] - last["y"]) ** 2
+            d1 = (g[-1]["x"] - last["x"]) ** 2 + (g[-1]["y"] - last["y"]) ** 2
+            if d1 < d0:
+                g = g[::-1]
+        ordered.extend(g)
+        last = ordered[-1]
+
     return ordered
 
 
