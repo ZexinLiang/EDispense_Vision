@@ -49,14 +49,17 @@ OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 CONFIG_DIR = os.path.join(BASE_DIR, 'config')
 XY_CALIB_PATH = os.path.join(CONFIG_DIR, 'xy_calib.json')
 AOI_IMAGE_DIR = '/media/elf/OPI_BOOT/AOI_Picture'
-SOLDER_Z_DOWN_STEPS = 820
+SOLDER_Z_DOWN_STEPS = 890
+SOLDER_Z_LIFT_POS = 600
 SOLDER_SQUEEZE_COUNT = 1
 SOLDER_STEP_TIMEOUT_MS = 12000
+SOLDER_HOME_TIMEOUT_MS = 20000
 SOLDER_TIMER_INTERVAL_MS = 50
 SOLDER_XY_MIN_WAIT_MS = 1200
-SOLDER_Z_DOWN_MIN_WAIT_MS = 1800
+SOLDER_Z_DOWN_MIN_WAIT_MS = 0
 SOLDER_SQUEEZE_MIN_WAIT_MS = 500
-SOLDER_Z_UP_MIN_WAIT_MS = 1800
+SOLDER_Z_UP_MIN_WAIT_MS = 1000
+SOLDER_HOME_MIN_WAIT_MS = 3000
 sys.path.insert(0, os.path.join(BASE_DIR, 'vision'))
 sys.path.insert(0, BASE_DIR)  # motor_control.py在项目根目录
 
@@ -1020,8 +1023,17 @@ class MainWindow(QMainWindow):
         self.btn_capture.setFixedHeight(S(42))
         self.btn_load = QPushButton("⊞ 加载图片")
         self.btn_load.setFixedHeight(S(42))
+        # 点锡模式下btn_load复用为"暂停"; 暂停后分裂出"继续"+"终止"(默认隐藏)
+        self.btn_resume = QPushButton("▶ 继续")
+        self.btn_resume.setFixedHeight(S(42))
+        self.btn_resume.setVisible(False)
+        self.btn_terminate = QPushButton("■ 终止")
+        self.btn_terminate.setFixedHeight(S(42))
+        self.btn_terminate.setVisible(False)
         btn_row2.addWidget(self.btn_capture)
         btn_row2.addWidget(self.btn_load)
+        btn_row2.addWidget(self.btn_resume)
+        btn_row2.addWidget(self.btn_terminate)
         ctrl_layout.addLayout(btn_row2)
 
         self.btn_execute = QPushButton("⚡ 执行点锡")
@@ -1108,7 +1120,9 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self.start_camera)
         self.btn_stop.clicked.connect(self.stop_camera)
         self.btn_capture.clicked.connect(self.capture_frame)
-        self.btn_load.clicked.connect(self.load_image)
+        self.btn_load.clicked.connect(self._on_btn_load_clicked)
+        self.btn_resume.clicked.connect(self._on_solder_resume)
+        self.btn_terminate.clicked.connect(self._on_solder_terminate)
         self.btn_execute.clicked.connect(self.execute_action)
 
     # ----------------------------------------------------------
@@ -1275,7 +1289,16 @@ class MainWindow(QMainWindow):
             return
         self.btn_capture.setText("◎ 路径生成" if is_solder else "◎ 锁定当前帧")
         self.btn_capture.setEnabled(True)
-        self.btn_load.setEnabled(not is_solder)
+        # btn_load: 点锡模式复用为"暂停"(待机禁用,执行时启用); AOI模式为"加载图片"
+        if is_solder:
+            self.btn_load.setText("⏸ 暂停")
+            self.btn_load.setEnabled(False)
+        else:
+            self.btn_load.setText("⊞ 加载图片")
+            self.btn_load.setEnabled(True)
+        self.btn_resume.setVisible(False)
+        self.btn_terminate.setVisible(False)
+        self.btn_load.setVisible(True)
         self.btn_execute.setText("⚡ 执行点锡" if is_solder else "🔍 执行AOI检测")
         self.btn_execute.setEnabled(False)
         if is_solder:
@@ -2031,21 +2054,47 @@ class MainWindow(QMainWindow):
             self.log("⚠ 无有效点锡点")
             return
 
+        # 预构建命令队列: 开始回零→[XY→Z下降到接触→挤锡→Z抬到安全位]×N→结束回零
+        # Z命令存目标绝对位置(z_abs), 发送时按当前实际Z实时算delta, 暂停回零后续跑也不会错乱
         total = len(exec_points)
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(0)
-        self.btn_execute.setEnabled(False)
-        self._exec_idx = 0
-        self._exec_points = exec_points
-        self._exec_phase = 'xy'
+        cmds = [{'label': '开始回零', 'cmd': 0x03, 'args': (),
+                 'wait': SOLDER_HOME_MIN_WAIT_MS, 'timeout': SOLDER_HOME_TIMEOUT_MS}]
+        for i, pt in enumerate(exec_points):
+            cmds.append({'label': f"点{i+1}/{total} XY→({pt['x']:.1f},{pt['y']:.1f})",
+                         'cmd': 0x01, 'args': (pt['x'], pt['y']),
+                         'wait': SOLDER_XY_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS})
+            cmds.append({'label': f'  Z下降到接触({SOLDER_Z_DOWN_STEPS})', 'cmd': 0x06, 'z_abs': SOLDER_Z_DOWN_STEPS,
+                         'wait': SOLDER_Z_DOWN_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS})
+            cmds.append({'label': '  挤锡', 'cmd': 0x07, 'args': (SOLDER_SQUEEZE_COUNT,),
+                         'wait': SOLDER_SQUEEZE_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS})
+            cmds.append({'label': f'  Z抬到{SOLDER_Z_LIFT_POS}', 'cmd': 0x06, 'z_abs': SOLDER_Z_LIFT_POS,
+                         'wait': SOLDER_Z_UP_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS,
+                         'pt_end': i})
+        cmds.append({'label': '结束回零', 'cmd': 0x03, 'args': (),
+                     'wait': SOLDER_HOME_MIN_WAIT_MS, 'timeout': SOLDER_HOME_TIMEOUT_MS})
+
+        self._exec_cmds = cmds
+        self._exec_ci = 0
         self._exec_waiting = False
         self._exec_cmd_ts = 0.0
         self._exec_started_at = time.time()
+        self._exec_pause_req = False
+        self._exec_paused = False
+        self._exec_cur_z = 0
+        self.progress_bar.setMaximum(len(cmds))
+        self.progress_bar.setValue(0)
+        self.btn_execute.setEnabled(False)
+        # 进入执行态: 暂停按钮可用, 继续/终止隐藏
+        self.btn_load.setText("⏸ 暂停")
+        self.btn_load.setEnabled(True)
+        self.btn_load.setVisible(True)
+        self.btn_resume.setVisible(False)
+        self.btn_terminate.setVisible(False)
 
         self._exec_timer = QTimer()
         self._exec_timer.timeout.connect(self._exec_step)
         self._exec_timer.start(SOLDER_TIMER_INTERVAL_MS)
-        self.log(f"⚙ 开始执行点锡: {total}点，Z下降{SOLDER_Z_DOWN_STEPS}步，挤锡{SOLDER_SQUEEZE_COUNT}次/点")
+        self.log(f"⚙ 开始执行点锡: {total}点，前后各回零，点间Z抬至{SOLDER_Z_LIFT_POS}")
 
     def _exec_abort(self, reason):
         """停止点锡状态机并恢复按钮。"""
@@ -2054,8 +2103,71 @@ class MainWindow(QMainWindow):
                 self._exec_timer.stop()
         except Exception:
             pass
+        self._exec_paused = False
+        self._exec_pause_req = False
+        self._exec_pause_homing = False
+        self._solder_reset_buttons()
         self.btn_execute.setEnabled(True)
         self.log(f"✗ 点锡执行中止: {reason}")
+
+    def _solder_reset_buttons(self):
+        """点锡按钮恢复到待机态: 仅显示禁用的'暂停', 隐藏继续/终止。"""
+        self.btn_resume.setVisible(False)
+        self.btn_terminate.setVisible(False)
+        self.btn_load.setVisible(True)
+        self.btn_load.setText("⏸ 暂停")
+        self.btn_load.setEnabled(False)
+
+    def _on_btn_load_clicked(self):
+        """btn_load点击分派: 点锡模式=暂停; AOI模式=加载图片。"""
+        if self.current_mode == "solder":
+            self._on_solder_pause()
+        else:
+            self.load_image()
+
+    def _on_solder_pause(self):
+        """暂停: 仅置标志, 状态机会在完成当前点(pt_end)后回零并真正停下。"""
+        if not getattr(self, '_exec_timer', None) or not self._exec_timer.isActive():
+            return
+        if self._exec_pause_req or self._exec_paused:
+            return
+        self._exec_pause_req = True
+        self.btn_load.setEnabled(False)
+        self.btn_load.setText("⏸ 暂停中…")
+        self.log("⏸ 已请求暂停，完成当前点后回零停下")
+
+    def _on_solder_resume(self):
+        """继续: 从暂停处接着点。"""
+        if not self._exec_paused:
+            return
+        self._exec_paused = False
+        self.btn_resume.setVisible(False)
+        self.btn_terminate.setVisible(False)
+        self.btn_load.setVisible(True)
+        self.btn_load.setText("⏸ 暂停")
+        self.btn_load.setEnabled(True)
+        self.log(f"▶ 继续点锡 (从第{self._exec_ci+1}/{len(self._exec_cmds)}步)")
+        if not getattr(self, '_exec_timer', None):
+            self._exec_timer = QTimer()
+            self._exec_timer.timeout.connect(self._exec_step)
+        self._exec_timer.start(SOLDER_TIMER_INTERVAL_MS)
+
+    def _on_solder_terminate(self):
+        """终止: 直接结束(暂停已含回零, 不再回零)。"""
+        if not self._exec_paused:
+            return
+        try:
+            if getattr(self, '_exec_timer', None):
+                self._exec_timer.stop()
+        except Exception:
+            pass
+        self._exec_paused = False
+        self._exec_pause_req = False
+        self._solder_reset_buttons()
+        self.btn_execute.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.log("■ 点锡已终止")
+
 
     def _exec_motor_busy(self):
         """读取motor busy状态，兼容旧版motor_control无is_busy。"""
@@ -2064,76 +2176,93 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
-    def _exec_min_wait_ms(self, phase):
-        """阶段最小等待时间: 兜底STM32状态上报过早清busy导致命令连发。"""
-        if phase == 'z_down':
-            return SOLDER_XY_MIN_WAIT_MS
-        if phase == 'squeeze':
-            return SOLDER_Z_DOWN_MIN_WAIT_MS
-        if phase == 'z_up':
-            return SOLDER_SQUEEZE_MIN_WAIT_MS
-        if phase == 'xy':
-            return SOLDER_Z_UP_MIN_WAIT_MS
-        return 0
-
     def _exec_wait_done(self):
-        """若上一条运动/挤锡仍在执行则等待；同时满足阶段最小等待后才发送下一条。"""
+        """正在等待的命令(_exec_wait_cmd): busy未释放或未达最小等待则继续等; 超时则中止。"""
         if not self._exec_waiting:
             return True
+        cur = getattr(self, '_exec_wait_cmd', None) or {}
         elapsed_ms = (time.time() - self._exec_cmd_ts) * 1000
-        if elapsed_ms > SOLDER_STEP_TIMEOUT_MS:
-            self._exec_abort(f"等待{self._exec_phase}完成超时")
+        if elapsed_ms > cur.get('timeout', SOLDER_STEP_TIMEOUT_MS):
+            self._exec_abort(f"等待[{cur.get('label','?').strip()}]完成超时")
             return False
-        if elapsed_ms < self._exec_min_wait_ms(self._exec_phase):
+        if elapsed_ms < cur.get('wait', 0):
             return False
         if self._exec_motor_busy():
             return False
         self._exec_waiting = False
         return True
 
-    def _exec_send(self, phase, cmd_id, *args):
-        """发送一步执行命令，成功后进入等待busy释放。"""
-        ok = self._send_cmd(cmd_id, *args)
-        if ok is False:
-            self._exec_abort(f"发送{phase}命令失败")
-            return False
-        self._exec_phase = phase
-        self._exec_waiting = True
-        self._exec_cmd_ts = time.time()
-        return True
-
     def _exec_step(self):
-        """点锡执行状态机：等待上一条命令完成后发送下一条。"""
+        """点锡执行状态机: 顺序发送预构建命令队列, 每条等待完成后再发下一条。"""
         if self._motor is None or not self._motor.is_online():
             self._exec_abort("执行系统离线")
             return
         if not self._exec_wait_done():
             return
 
-        if self._exec_idx >= len(self._exec_points):
+        # 暂停检测: 上一条命令是某点的收尾(pt_end)且收到暂停请求 → 回零后停下
+        if self._exec_pause_req and not self._exec_paused and self._exec_ci > 0:
+            prev = self._exec_cmds[self._exec_ci - 1]
+            if 'pt_end' in prev:
+                if not getattr(self, '_exec_pause_homing', False):
+                    # 先发一次回零, 等其完成再真正停
+                    self._exec_pause_homing = True
+                    self.log("⏸ 暂停: 当前点已完成，回零中…")
+                    if self._send_cmd(0x03) is False:
+                        self._exec_abort("暂停回零发送失败")
+                        return
+                    self._exec_waiting = True
+                    self._exec_cmd_ts = time.time()
+                    self._exec_wait_cmd = {'label': '暂停回零', 'wait': SOLDER_HOME_MIN_WAIT_MS,
+                                           'timeout': SOLDER_HOME_TIMEOUT_MS}
+                    return
+                else:
+                    # 回零完成, 进入暂停态
+                    self._exec_pause_homing = False
+                    self._exec_pause_req = False
+                    self._exec_cur_z = 0
+                    self._exec_paused = True
+                    self._exec_timer.stop()
+                    self.btn_load.setVisible(False)
+                    self.btn_resume.setVisible(True)
+                    self.btn_terminate.setVisible(True)
+                    self.log(f"⏸ 已暂停 (已完成{self._exec_ci}/{len(self._exec_cmds)}步)，点继续接着点，或终止")
+                    return
+
+        if self._exec_ci >= len(self._exec_cmds):
             self._exec_timer.stop()
             self.progress_bar.setValue(self.progress_bar.maximum())
+            self._exec_paused = False
+            self._exec_pause_req = False
+            self._solder_reset_buttons()
             self.btn_execute.setEnabled(True)
             elapsed = time.time() - getattr(self, '_exec_started_at', time.time())
-            self.log(f"✓ 点锡执行完成: {len(self._exec_points)}点，用时{elapsed:.1f}s")
+            self.log(f"✓ 点锡执行完成，用时{elapsed:.1f}s")
             return
 
-        pt = self._exec_points[self._exec_idx]
-        phase = getattr(self, '_exec_phase', 'xy')
-
-        if phase == 'xy':
-            self.log(f"▸ 点{self._exec_idx+1}/{len(self._exec_points)} XY→({pt['x']:.1f},{pt['y']:.1f})")
-            self._exec_send('z_down', 0x01, pt['x'], pt['y'])
-        elif phase == 'z_down':
-            self._exec_send('squeeze', 0x06, SOLDER_Z_DOWN_STEPS)
-        elif phase == 'squeeze':
-            self._exec_send('z_up', 0x07, SOLDER_SQUEEZE_COUNT)
-        elif phase == 'z_up':
-            self._exec_send('xy', 0x06, -SOLDER_Z_DOWN_STEPS)
-            self._exec_idx += 1
-            self.progress_bar.setValue(self._exec_idx)
-        else:
-            self._exec_abort(f"未知执行阶段: {phase}")
+        c = self._exec_cmds[self._exec_ci]
+        self.log(f"▸ {c['label']}")
+        # Z命令用绝对目标实时换算相对步数, 兼容暂停回零后继续
+        args = c.get('args', ())
+        next_z = None
+        if c.get('cmd') == 0x06 and 'z_abs' in c:
+            cur_z = getattr(self, '_exec_cur_z', 0)
+            next_z = int(c['z_abs'])
+            args = (next_z - cur_z,)
+            self.log(f"  Z: {cur_z} → {next_z} (delta {args[0]})")
+        ok = self._send_cmd(c['cmd'], *args)
+        if ok is False:
+            self._exec_abort(f"发送[{c['label'].strip()}]失败")
+            return
+        if c.get('cmd') == 0x03:
+            self._exec_cur_z = 0
+        elif next_z is not None:
+            self._exec_cur_z = next_z
+        self._exec_ci += 1
+        self._exec_waiting = True
+        self._exec_cmd_ts = time.time()
+        self._exec_wait_cmd = c
+        self.progress_bar.setValue(self._exec_ci)
 
     def on_result(self, frame, detections, elapsed):
         """推理结果回调(InferenceThread信号)：更新状态栏+绘制检测框+显示帧"""
