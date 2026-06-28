@@ -34,8 +34,8 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QComboBox, QGroupBox, QTextEdit,
     QProgressBar, QLineEdit, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
-from PyQt5.QtGui import QPainter, QPainterPath, QImage, QPixmap, QFont, QFontDatabase
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent, QPointF
+from PyQt5.QtGui import QPainter, QPainterPath, QImage, QPixmap, QFont, QFontDatabase, QColor, QPen, QBrush
 
 # ============================================================
 # 路径配置
@@ -48,8 +48,10 @@ MODEL_PATH = TINNING_MODEL_PATH
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 CONFIG_DIR = os.path.join(BASE_DIR, 'config')
 XY_CALIB_PATH = os.path.join(CONFIG_DIR, 'xy_calib.json')
+Z_PLANE_PATH = os.path.join(CONFIG_DIR, 'z_plane.json')
 AOI_IMAGE_DIR = '/media/elf/OPI_BOOT/AOI_Picture'
 SOLDER_Z_DOWN_STEPS = 890
+SOLDER_DISP_CROP_W = 1080  # 点锡模式显示裁剪宽(正方形,=识别有效区中心1080); 改此值偏移自动跟随
 SOLDER_Z_LIFT_POS = 600
 SOLDER_SQUEEZE_COUNT = 1
 SOLDER_STEP_TIMEOUT_MS = 12000
@@ -568,6 +570,143 @@ class IOSStepper(QWidget):
 
 
 # ============================================================
+# 正方形容器: 内部控件强制居中正方形(边长=min(宽,高))
+# ============================================================
+class SquareBox(QWidget):
+    """让内部控件始终保持正方形并居中, 解决视频被侧栏挤压变形。"""
+    def __init__(self, inner, parent=None):
+        super().__init__(parent)
+        self._inner = inner
+        inner.setParent(self)
+
+    def resizeEvent(self, e):
+        side = min(self.width(), self.height())
+        x = (self.width() - side) // 2
+        y = (self.height() - side) // 2
+        self._inner.setGeometry(x, y, side, side)
+
+
+# ============================================================
+# 点锡轨迹图 (直角坐标系, 路径包络自动缩放, 线渲染实时轨迹)
+# ============================================================
+class TrajectoryWidget(QWidget):
+    """点锡运动轨迹显示: 直角坐标系, 按所有点的包络自动缩放。
+    set_points()设置全部规划点(机床XY); set_progress()更新已点到第几个+当前位置。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(160)
+        self._pts = []          # [(X,Y), ...] 机床坐标全部规划点
+        self._done = 0          # 已完成点数
+        self._cur = None        # 当前针尖位置(X,Y)
+        self._bg = QColor(28, 28, 30)
+
+    def set_points(self, pts):
+        """设置全部规划点(机床XY列表), 重置进度。"""
+        self._pts = [(float(x), float(y)) for x, y in pts]
+        self._done = 0
+        self._cur = None
+        self.update()
+
+    def set_progress(self, done, cur=None):
+        """更新已完成点数和当前针尖位置。"""
+        self._done = done
+        if cur is not None:
+            self._cur = (float(cur[0]), float(cur[1]))
+        self.update()
+
+    def clear(self):
+        """清空轨迹。"""
+        self._pts = []
+        self._done = 0
+        self._cur = None
+        self.update()
+
+    def _bounds(self):
+        """所有点(含当前)的包络, 返回(minx,miny,maxx,maxy)。"""
+        xs = [p[0] for p in self._pts]
+        ys = [p[1] for p in self._pts]
+        if self._cur:
+            xs.append(self._cur[0]); ys.append(self._cur[1])
+        if not xs:
+            return (0.0, 0.0, 1.0, 1.0)
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        if maxx - minx < 1e-6:
+            minx -= 1; maxx += 1
+        if maxy - miny < 1e-6:
+            miny -= 1; maxy += 1
+        return (minx, miny, maxx, maxy)
+
+    def paintEvent(self, ev):
+        from PyQt5.QtGui import QPainter, QPen, QBrush, QPainterPath
+        from PyQt5.QtCore import QRectF
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing, True)
+        W, H = self.width(), self.height()
+        # 白底 + 圆角裁剪
+        radius = 10
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), radius, radius)
+        qp.setClipPath(path)
+        qp.fillRect(0, 0, W, H, QColor(255, 255, 255))
+
+        margin = 22
+        plot_w = max(1, W - 2 * margin)
+        plot_h = max(1, H - 2 * margin)
+        minx, miny, maxx, maxy = self._bounds()
+        # 逆时针90°: 横轴←Y包络, 纵轴←X包络
+        s = min(plot_w / (maxy - miny), plot_h / (maxx - minx))
+        ox = margin + (plot_w - (maxy - miny) * s) / 2
+        oy = margin + (plot_h - (maxx - minx) * s) / 2
+
+        def to_px(X, Y):
+            # 逆时针90°: X大→上(py小), Y大→左(px小)
+            px = ox + (maxy - Y) * s
+            py = oy + (maxx - X) * s
+            return QPointF(px, py)
+
+        # 坐标轴框(浅灰)
+        qp.setPen(QPen(QColor(200, 200, 200), 1))
+        qp.drawRoundedRect(QRectF(margin, margin, plot_w, plot_h), 6, 6)
+        # 标题(深灰)
+        qp.setPen(QPen(QColor(90, 90, 90), 1))
+        qp.setFont(QFont("PingFang SC", 9))
+        qp.drawText(margin, margin - 6, "运动轨迹")
+
+        if not self._pts:
+            qp.setPen(QPen(QColor(170, 170, 170), 1))
+            qp.drawText(self.rect(), Qt.AlignCenter, "无路径")
+            return
+
+        # 已走过的轨迹连线(黑)
+        if self._done >= 2:
+            qp.setPen(QPen(QColor(0, 0, 0), 2))
+            for i in range(1, min(self._done, len(self._pts))):
+                qp.drawLine(to_px(*self._pts[i-1]), to_px(*self._pts[i]))
+
+        # 所有规划点: 已点黑实心, 未点浅灰
+        for i, (X, Y) in enumerate(self._pts):
+            if i < self._done:
+                qp.setBrush(QBrush(QColor(0, 0, 0)))
+                qp.setPen(QPen(QColor(0, 0, 0), 1))
+                r = 4
+            else:
+                qp.setBrush(QBrush(QColor(190, 190, 190)))
+                qp.setPen(QPen(QColor(190, 190, 190), 1))
+                r = 3
+            c = to_px(X, Y)
+            qp.drawEllipse(c, r, r)
+
+        # 当前针尖位置: 高亮十字(橙)
+        if self._cur:
+            c = to_px(*self._cur)
+            qp.setPen(QPen(QColor(255, 149, 0), 2))
+            qp.drawLine(QPointF(c.x()-7, c.y()), QPointF(c.x()+7, c.y()))
+            qp.drawLine(QPointF(c.x(), c.y()-7), QPointF(c.x(), c.y()+7))
+
+
+# ============================================================
 # 推理线程
 # ============================================================
 class InferenceThread(QThread):
@@ -660,8 +799,8 @@ class InferenceThread(QThread):
                 bboxes[:, [0, 2]] += x1_crop
                 bboxes[:, [1, 3]] += y1_crop
 
-            # 裁剪显示区域: 中心1640x1080
-            disp_w = min(1640, w)
+            # 裁剪显示区域: 中心正方形(=识别有效区), 偏移自动跟随
+            disp_w = min(SOLDER_DISP_CROP_W, w)
             x1_disp = cx - disp_w // 2
             self.disp_offset_x = x1_disp  # 记录显示裁剪x偏移, 供路径生成还原全图坐标
             display_frame = frame[0:h, x1_disp:x1_disp+disp_w].copy()
@@ -831,6 +970,11 @@ class MainWindow(QMainWindow):
         self._xy_calib_pairs = []       # [(u,v,X,Y), ...] 已记录的标定对
         self._xy_calib_M = None         # 解算出的2x3仿射矩阵(像素→机床)
         self._load_xy_calib()
+        # Z平面校准: (a,b,c) 满足 Z=a*X+b*Y+c; None表示未校准(点锡用SOLDER_Z_DOWN_STEPS后备)
+        self._z_plane = None
+        self._z_calib_active = False
+        self._z_calib_pts = []          # [(X,Y,Z), ...] 三点校准记录
+        self._load_z_plane()
         # XY测试(验证标定准不准)状态
         self._xytest_state = 'idle'     # idle/picking
         self._xytest_frame = None       # 冻结顶图
@@ -918,12 +1062,71 @@ class MainWindow(QMainWindow):
         self._tip_cam_bar.setVisible(False)
         left_layout.addWidget(self._tip_cam_bar)
 
-        # 视频显示区
+        # 视频显示区 + 点锡侧栏(轨迹/坐标/急停回零)
+        video_row = QHBoxLayout()
+        video_row.setSpacing(S(6))
         self.video_label = PinchZoomLabel("点击 [开始] 启动摄像头")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(S(400), S(300))
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
-        left_layout.addWidget(self.video_label, 1)
+        self.video_label.setMinimumSize(S(300), S(300))
+        self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self._video_square = SquareBox(self.video_label)
+        self._video_square.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        video_row.addWidget(self._video_square, 1)
+
+        # === 点锡侧栏(仅点锡模式可见) ===
+        self._solder_side = QWidget()
+        self._solder_side.setFixedWidth(S(200))
+        side_v = QVBoxLayout(self._solder_side)
+        side_v.setContentsMargins(0, 0, 0, 0)
+        side_v.setSpacing(S(6))
+        # 上: 轨迹图(占据侧栏主要空间)
+        self._traj_widget = TrajectoryWidget()
+        self._traj_widget.setMinimumHeight(S(260))
+        side_v.addWidget(self._traj_widget, 1)
+        # 中: XYZ实时坐标(横排一栏, 小字, 矮)
+        coord_box = QGroupBox("实时坐标")
+        coord_box.setFixedHeight(S(46))
+        coord_h = QHBoxLayout(coord_box)
+        coord_h.setSpacing(S(4))
+        coord_h.setContentsMargins(S(6), S(2), S(6), S(2))
+        self._lbl_solder_x = QLabel("X: 0.0")
+        self._lbl_solder_y = QLabel("Y: 0.0")
+        self._lbl_solder_z = QLabel("Z: 0")
+        for lb in (self._lbl_solder_x, self._lbl_solder_y, self._lbl_solder_z):
+            lb.setStyleSheet(f"font-size: {S(11)}px; font-weight: 600; color: #0a84ff;")
+            coord_h.addWidget(lb)
+        side_v.addWidget(coord_box)
+        # 系统状态(迁移自调试模式, 点锡侧栏独立控件, 矮)
+        sstat_box = QGroupBox("系统状态")
+        sstat_box.setFixedHeight(S(46))
+        sstat_h = QHBoxLayout(sstat_box)
+        sstat_h.setSpacing(S(6))
+        sstat_h.setContentsMargins(S(6), S(2), S(6), S(2))
+        self._lbl_solder_state_led = QLabel("⚪")
+        self._lbl_solder_state_led.setStyleSheet(f"font-size: {S(14)}px;")
+        self._lbl_solder_state_txt = QLabel("未连接")
+        self._lbl_solder_state_txt.setStyleSheet(f"font-size: {S(11)}px; font-weight: 600;")
+        sstat_h.addWidget(self._lbl_solder_state_led)
+        sstat_h.addWidget(self._lbl_solder_state_txt)
+        sstat_h.addStretch(1)
+        side_v.addWidget(sstat_box)
+        # 下: 急停 + 回原点
+        sbtn = QHBoxLayout()
+        sbtn.setSpacing(S(8))
+        self._btn_solder_estop = QPushButton("🛑 急停")
+        self._btn_solder_estop.setFixedHeight(S(48))
+        self._btn_solder_estop.setStyleSheet(f"font-size: {S(15)}px; font-weight: 700; background: #ff3b30; color: white; border: none; border-radius: {S(8)}px;")
+        self._btn_solder_estop.clicked.connect(self._solder_estop)
+        self._btn_solder_home = QPushButton("⌂ 回原点")
+        self._btn_solder_home.setFixedHeight(S(48))
+        self._btn_solder_home.setStyleSheet(f"font-size: {S(15)}px; font-weight: 700; background: #5856d6; color: white; border: none; border-radius: {S(8)}px;")
+        self._btn_solder_home.clicked.connect(self._solder_home)
+        sbtn.addWidget(self._btn_solder_estop)
+        sbtn.addWidget(self._btn_solder_home)
+        side_v.addLayout(sbtn)
+        video_row.addWidget(self._solder_side)
+
+        left_layout.addLayout(video_row, 1)
 
         # 标定按钮区(仅调试模式可见): XY标定 / Z补偿
         self._calib_bar = QWidget()
@@ -941,12 +1144,18 @@ class MainWindow(QMainWindow):
         self.btn_xy_calib.setFixedHeight(S(34))
         self.btn_xy_calib.setStyleSheet(f"font-size: {S(12)}px; background: #5856d6; color: white; border: none; border-radius: {S(6)}px;")
         self.btn_xy_calib.clicked.connect(self._xy_calib_start)
-        self.btn_z_calib = QPushButton("Z补偿")
+        self.btn_z_calib = QPushButton("Z校准")
         self.btn_z_calib.setFixedHeight(S(34))
         self.btn_z_calib.setStyleSheet(f"font-size: {S(12)}px; background: #8e8e93; color: white; border: none; border-radius: {S(6)}px;")
-        self.btn_z_calib.clicked.connect(lambda: self.log("⚠ Z补偿功能待实现"))
+        self.btn_z_calib.clicked.connect(self._start_z_calib)
+        self.btn_z_record = QPushButton("记录Z点")
+        self.btn_z_record.setFixedHeight(S(34))
+        self.btn_z_record.setStyleSheet(f"font-size: {S(12)}px; background: #ff9500; color: white; border: none; border-radius: {S(6)}px;")
+        self.btn_z_record.clicked.connect(self._record_z_calib)
+        self.btn_z_record.setVisible(False)
         calib_main.addWidget(self.btn_xy_calib)
         calib_main.addWidget(self.btn_z_calib)
+        calib_main.addWidget(self.btn_z_record)
         calib_v.addLayout(calib_main)
         # XY标定上下文按钮行(标定进行中才启用)
         calib_ctx = QHBoxLayout()
@@ -1263,6 +1472,9 @@ class MainWindow(QMainWindow):
         """根据当前模式更新按钮可用性和文字(点锡/AOI/调试差异化)"""
         is_solder = self.current_mode == "solder"
         is_debug = self.current_mode == "debug"
+        # 点锡侧栏(轨迹/坐标/急停回零): 仅点锡模式可见
+        if hasattr(self, '_solder_side'):
+            self._solder_side.setVisible(is_solder)
         # 调试模式：隐藏整个右侧控制面板，显示调试面板
         if hasattr(self, '_right_widget'):
             self._right_widget.setVisible(not is_debug)
@@ -1574,6 +1786,120 @@ class MainWindow(QMainWindow):
         X = M[0, 0]*u + M[0, 1]*v + M[0, 2]
         Y = M[1, 0]*u + M[1, 1]*v + M[1, 2]
         return (float(X), float(Y))
+
+    # ---------- 三点 Z 平面校准 ----------
+    def _save_z_plane(self, abc, pts):
+        """保存Z平面系数(a,b,c)+三点原始记录到json。"""
+        import json
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            data = {
+                "plane_abc": [float(abc[0]), float(abc[1]), float(abc[2])],
+                "points": [{"X": float(x), "Y": float(y), "Z": float(z)} for (x, y, z) in pts],
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(Z_PLANE_PATH, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"✗ Z平面文件保存失败: {e}")
+
+    def _load_z_plane(self):
+        """上电加载已保存的Z平面(若存在)。"""
+        import json
+        try:
+            if os.path.exists(Z_PLANE_PATH):
+                with open(Z_PLANE_PATH) as f:
+                    data = json.load(f)
+                self._z_plane = tuple(float(v) for v in data["plane_abc"])
+                print(f"[z_plane] loaded: {data.get('timestamp')}, abc={self._z_plane}")
+        except Exception as e:
+            print(f"[z_plane] load failed: {e}")
+
+    def z_at(self, x, y):
+        """返回(x,y)处的点锡下降目标Z。已校准用平面插值, 否则返回后备默认SOLDER_Z_DOWN_STEPS。"""
+        if self._z_plane is None:
+            return SOLDER_Z_DOWN_STEPS
+        a, b, c = self._z_plane
+        z = a * x + b * y + c
+        # 安全钳制到Z行程[0,950]
+        return int(max(0, min(950, round(z))))
+
+    @staticmethod
+    def _solve_z_plane(pts):
+        """最小二乘解 Z=a*X+b*Y+c (>=3点)。返回(abc, max_residual)或(None, None)(退化)。"""
+        import numpy as np
+        P = np.array(pts, dtype=np.float64)
+        A = np.column_stack([P[:, 0], P[:, 1], np.ones(len(P))])
+        Z = P[:, 2]
+        # 退化检测: A秩<3说明XY点近似共线, 无法唯一确定平面
+        XY = P[:, :2] - P[:, :2].mean(axis=0)
+        # 尺度无关退化判定: XY两主轴跨度(奇异值)最小的 < 最大的5%% 视为共线
+        sv = np.linalg.svd(XY, compute_uv=False)
+        if len(sv) < 2 or sv[0] < 1e-6 or sv[-1] / sv[0] < 0.05:
+            return (None, None)
+        try:
+            abc, *_ = np.linalg.lstsq(A, Z, rcond=None)
+            fitted = A @ abc
+            max_res = float(np.max(np.abs(fitted - Z)))
+            return ((float(abc[0]), float(abc[1]), float(abc[2])), max_res)
+        except Exception:
+            return (None, None)
+
+    def _start_z_calib(self):
+        """进入/退出四点Z校准。仅调试模式。"""
+        if getattr(self, '_z_calib_active', False):
+            self._cancel_z_calib()
+            return
+        self._z_calib_active = True
+        self._z_calib_pts = []
+        self.btn_z_calib.setText("取消Z校准")
+        self.btn_z_record.setVisible(True)
+        self.btn_z_record.setEnabled(True)
+        if hasattr(self, '_lbl_calib_status'):
+            self._lbl_calib_status.setText("Z校准: jog针尖到板面接触, 记录第1/4点(板子四角各一点)")
+        self.log("▸ Z校准: 手动jog针尖到板面接触(侧视相机辅助), 点[记录Z点]存第1点。共4点, 板子四周各标一点")
+
+    def _record_z_calib(self):
+        """记录当前(X,Y,Z)为一个校准点; 满4点则最小二乘解平面并保存。"""
+        if not getattr(self, '_z_calib_active', False):
+            return
+        x, y, z = self._current_x, self._current_y, self._current_z
+        self._z_calib_pts.append((x, y, z))
+        n = len(self._z_calib_pts)
+        self.log(f"  已记录点{n}/4: X={x:.1f} Y={y:.1f} Z={z}")
+        if n < 4:
+            if hasattr(self, '_lbl_calib_status'):
+                self._lbl_calib_status.setText(f"Z校准: 已记录{n}/4, 移到下一角再记录")
+            return
+        # 满4点: 最小二乘解平面
+        abc, max_res = self._solve_z_plane(self._z_calib_pts)
+        if abc is None:
+            self.log("✗ 四点近似共线/退化, 无法确定平面。请重做, 四点尽量散开到板子四周")
+            if hasattr(self, '_lbl_calib_status'):
+                self._lbl_calib_status.setText("Z校准失败: 点共线, 请重做")
+            self._cancel_z_calib()
+            return
+        self._z_plane = abc
+        self._save_z_plane(abc, self._z_calib_pts)
+        a, b, c = abc
+        self.log(f"✓ Z平面已标定: Z={a:.4f}·X+{b:.4f}·Y+{c:.1f}, 拟合残差max={max_res:.1f}步, 已保存")
+        if max_res > 30:
+            self.log(f"⚠ 残差偏大({max_res:.1f}步), 可能某点记录有误或板子不平, 建议复核/重做")
+        if hasattr(self, '_lbl_calib_status'):
+            self._lbl_calib_status.setText(f"Z校准完成✓ 残差{max_res:.0f}步, 点锡按平面插值")
+        self._z_calib_active = False
+        self._z_calib_pts = []
+        self.btn_z_calib.setText("Z校准✓")
+        self.btn_z_record.setVisible(False)
+
+    def _cancel_z_calib(self):
+        """取消Z校准, 复位按钮。"""
+        self._z_calib_active = False
+        self._z_calib_pts = []
+        self.btn_z_calib.setText("Z校准✓" if self._z_plane is not None else "Z校准")
+        self.btn_z_record.setVisible(False)
+        self.log("▸ Z校准已取消")
+
 
     # ----------------------------------------------------------
     # XY测试: 在顶图选点→标定矩阵换算机床XY→GO移动(仅XY,不动Z)
@@ -2054,6 +2380,11 @@ class MainWindow(QMainWindow):
             self.log("⚠ 无有效点锡点")
             return
 
+        # 轨迹图: 设置全部规划点(机床XY), 重置进度
+        self._traj_done = 0
+        if hasattr(self, '_traj_widget'):
+            self._traj_widget.set_points([(p['x'], p['y']) for p in exec_points])
+
         # 预构建命令队列: 开始回零→[XY→Z下降到接触→挤锡→Z抬到安全位]×N→结束回零
         # Z命令存目标绝对位置(z_abs), 发送时按当前实际Z实时算delta, 暂停回零后续跑也不会错乱
         total = len(exec_points)
@@ -2063,7 +2394,8 @@ class MainWindow(QMainWindow):
             cmds.append({'label': f"点{i+1}/{total} XY→({pt['x']:.1f},{pt['y']:.1f})",
                          'cmd': 0x01, 'args': (pt['x'], pt['y']),
                          'wait': SOLDER_XY_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS})
-            cmds.append({'label': f'  Z下降到接触({SOLDER_Z_DOWN_STEPS})', 'cmd': 0x06, 'z_abs': SOLDER_Z_DOWN_STEPS,
+            z_target = self.z_at(pt['x'], pt['y'])
+            cmds.append({'label': f"  Z下降到接触({z_target})", 'cmd': 0x06, 'z_abs': z_target,
                          'wait': SOLDER_Z_DOWN_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS})
             cmds.append({'label': '  挤锡', 'cmd': 0x07, 'args': (SOLDER_SQUEEZE_COUNT,),
                          'wait': SOLDER_SQUEEZE_MIN_WAIT_MS, 'timeout': SOLDER_STEP_TIMEOUT_MS})
@@ -2199,6 +2531,14 @@ class MainWindow(QMainWindow):
             return
         if not self._exec_wait_done():
             return
+
+        # 更新轨迹已完成点数: 上一条是某点收尾(pt_end)即该点已点完
+        if self._exec_ci > 0:
+            _prev = self._exec_cmds[self._exec_ci - 1]
+            if 'pt_end' in _prev:
+                self._traj_done = _prev['pt_end'] + 1
+                if hasattr(self, '_traj_widget'):
+                    self._traj_widget.set_progress(self._traj_done)
 
         # 暂停检测: 上一条命令是某点的收尾(pt_end)且收到暂停请求 → 回零后停下
         if self._exec_pause_req and not self._exec_paused and self._exec_ci > 0:
@@ -2545,6 +2885,49 @@ class MainWindow(QMainWindow):
         self._send_cmd(0x01, self._current_x, self._current_y)
         self._homed = False   # 移动后已离开零点, 需重新回零才能再校准
 
+    def _solder_estop(self):
+        """点锡侧栏急停: 发0x02, 中止正在跑的点锡状态机, 进入锁定态(必须回原点才解除)。"""
+        self.log("🛑 急停")
+        self._send_cmd(0x02)
+        # 中止点锡状态机
+        try:
+            if getattr(self, '_exec_timer', None):
+                self._exec_timer.stop()
+        except Exception:
+            pass
+        self._exec_paused = False
+        self._exec_pause_req = False
+        if hasattr(self, '_solder_reset_buttons'):
+            self._solder_reset_buttons()
+        self.btn_execute.setEnabled(False)  # 锁定: 回原点前不能再执行
+        self._solder_estopped = True
+        self._update_solder_lock_ui()
+
+    def _solder_home(self):
+        """点锡侧栏回原点: 发0x03。点锡执行中禁用; 急停后用它解除锁定。"""
+        if getattr(self, '_exec_timer', None) and self._exec_timer.isActive() and not getattr(self, '_exec_paused', False):
+            self.log("⚠ 点锡执行中，不能回原点")
+            return
+        self.log("⌂ 回原点")
+        if self._send_cmd(0x03) is False:
+            self.log("✗ 回原点指令发送失败")
+            return
+        self._current_z = 0
+        # 解除急停锁定
+        if getattr(self, '_solder_estopped', False):
+            self._solder_estopped = False
+            self.btn_execute.setEnabled(True)
+            self.log("✓ 已回原点，急停解除")
+        self._update_solder_lock_ui()
+
+    def _update_solder_lock_ui(self):
+        """根据急停/执行态刷新点锡侧栏按钮可用性。"""
+        executing = bool(getattr(self, '_exec_timer', None) and self._exec_timer.isActive()
+                         and not getattr(self, '_exec_paused', False))
+        if hasattr(self, '_btn_solder_home'):
+            # 执行中禁用回原点; 其余可用
+            self._btn_solder_home.setEnabled(not executing)
+
     def _cmd_z_move(self, direction):
         """Z轴步进移动(框架stub)
         Args:
@@ -2663,6 +3046,23 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self._set_motion_state({0: "idle", 1: "moving", 2: "estop"}.get(st, "idle"))
+        elif self.current_mode == "solder":
+            # 更新点锡侧栏实时坐标 + 轨迹当前针尖位置
+            if hasattr(self, '_lbl_solder_x'):
+                self._lbl_solder_x.setText(f"X: {self._current_x:.1f}")
+                self._lbl_solder_y.setText(f"Y: {self._current_y:.1f}")
+                self._lbl_solder_z.setText(f"Z: {self._current_z:.0f}")
+            if hasattr(self, '_traj_widget'):
+                self._traj_widget.set_progress(getattr(self, '_traj_done', 0),
+                                               cur=(self._current_x, self._current_y))
+            # 系统状态(急停锁定优先, 否则按motor上报)
+            if hasattr(self, '_lbl_solder_state_led'):
+                if getattr(self, '_solder_estopped', False):
+                    led, txt = "🔴", "急停(需回原点)"
+                else:
+                    led, txt = {0: ("⚪", "已停止"), 1: ("🟢", "运动中"), 2: ("🔴", "急停")}.get(st, ("⚪", "已停止"))
+                self._lbl_solder_state_led.setText(led)
+                self._lbl_solder_state_txt.setText(txt)
 
     def _update_coord_display(self):
         """更新调试面板的XYZ坐标显示"""
