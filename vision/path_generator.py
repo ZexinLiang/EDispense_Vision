@@ -15,8 +15,9 @@ import json
 import cv2
 
 # ===== 参数配置 =====
-# 大焊盘面积阈值(像素^2)，超过此值用多点填充
-LARGE_PAD_AREA = 2000
+# 大/小焊盘判据(按长宽,非面积): 长宽"都"小于此值(像素)→小焊盘单点中心;
+# 任一边>=此值→大焊盘, 沿超长的轴铺多点(细长条只沿长边铺一排)。
+SINGLE_PAD_MAX_DIM = 45
 # 多点填充时点间距(像素)
 FILL_SPACING = 15
 # 点锡停留时间(ms)
@@ -43,40 +44,47 @@ def pixel_to_physical(points):
     return physical.tolist()
 
 
-def generate_dispense_points(bboxes, scores, class_ids):
+def generate_dispense_points(bboxes, scores, class_ids, fill_spacing=None):
     """
     根据检测结果生成点锡坐标
-    
+
     Args:
         bboxes: [[x1,y1,x2,y2], ...] 原图像素坐标
         scores: [float, ...]
         class_ids: [int, ...]
-    
+        fill_spacing: 多点填充间距(像素), None则用默认FILL_SPACING
+
     Returns:
         list of dict: [{"x":px,"y":py,"type":"single"/"fill","class":id,"dwell":ms,
                         "pad":焊盘索引,"pad_cx":焊盘中心x,"pad_cy":焊盘中心y}, ...]
     """
+    sp = float(fill_spacing) if fill_spacing else float(FILL_SPACING)
+    if sp <= 0:
+        sp = float(FILL_SPACING)
     all_points = []
-    
+
     for pad_idx, (bbox, score, cls_id) in enumerate(zip(bboxes, scores, class_ids)):
         x1, y1, x2, y2 = bbox
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         w = x2 - x1
         h = y2 - y1
-        area = w * h
         pad_meta = {"pad": pad_idx, "pad_cx": float(cx), "pad_cy": float(cy),
                     "pad_w": float(w), "pad_h": float(h)}
-        
-        if area >= LARGE_PAD_AREA:
-            # 大焊盘：网格填充
-            margin = FILL_SPACING * 0.5
-            xs = np.arange(x1 + margin, x2 - margin + 1, FILL_SPACING)
-            ys = np.arange(y1 + margin, y2 - margin + 1, FILL_SPACING)
-            if len(xs) == 0:
-                xs = [cx]
-            if len(ys) == 0:
-                ys = [cy]
+
+        if w >= SINGLE_PAD_MAX_DIM or h >= SINGLE_PAD_MAX_DIM:
+            # 大焊盘(任一边超阈值): 居中对称网格填充。各轴独立算点数,
+            # 细长条只有长边超阈值→长边铺多点, 短边span<=0自然退化成一排, 沿长边居中。
+            margin = sp * 0.5
+            span_x = max(0.0, w - 2 * margin)
+            span_y = max(0.0, h - 2 * margin)
+            nx = int(span_x // sp) + 1  # 该轴点数(至少1)
+            ny = int(span_y // sp) + 1
+            # 实际占用跨度, 居中: 起点 = 中心 - 占用跨度/2
+            used_x = (nx - 1) * sp
+            used_y = (ny - 1) * sp
+            xs = [cx - used_x / 2.0 + ix * sp for ix in range(nx)]
+            ys = [cy - used_y / 2.0 + iy * sp for iy in range(ny)]
             for iy, y in enumerate(ys):
                 # 蛇形走位减少空行程
                 row_xs = xs if iy % 2 == 0 else xs[::-1]
@@ -200,15 +208,18 @@ def path_to_gcode(path, z_travel=Z_TRAVEL, z_dispense=Z_DISPENSE, speed=MOVE_SPE
     return "\n".join(lines)
 
 
-def generate_path(bboxes, scores, class_ids, output_json=None, output_gcode=None):
+def generate_path(bboxes, scores, class_ids, output_json=None, output_gcode=None, fill_spacing=None):
     """
     主函数：从检测结果生成优化路径
-    
+
+    Args:
+        fill_spacing: 多点填充间距(像素), None则用默认FILL_SPACING
+
     Returns:
         dict: {"points": [...], "total": int, "gcode": str}
     """
     # 1. 生成点锡坐标
-    points = generate_dispense_points(bboxes, scores, class_ids)
+    points = generate_dispense_points(bboxes, scores, class_ids, fill_spacing=fill_spacing)
     print(f"[PathGen] 生成 {len(points)} 个点锡点 (来自 {len(bboxes)} 个检测目标)")
     
     # 2. 路径优化
