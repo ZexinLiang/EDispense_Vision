@@ -49,6 +49,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 CONFIG_DIR = os.path.join(BASE_DIR, 'config')
 XY_CALIB_PATH = os.path.join(CONFIG_DIR, 'xy_calib.json')
 Z_PLANE_PATH = os.path.join(CONFIG_DIR, 'z_plane.json')
+GERBER_DIR = '/media/elf/OPI_BOOT/Gerber'  # SD卡上传的gerber存放目录
 AOI_IMAGE_DIR = '/media/elf/OPI_BOOT/AOI_Picture'
 SOLDER_Z_DOWN_STEPS = 890
 SOLDER_DISP_CROP_W = 1080  # 点锡模式显示裁剪宽(正方形,=识别有效区中心1080); 改此值偏移自动跟随
@@ -282,6 +283,15 @@ class PinchZoomLabel(QLabel):
         self._gesture_in_progress = False  # 手势进行中用快速渲染
         self._gesture_active = False
         self._press_pos = None
+        # ---- Gerber 模板蒙版层 ----
+        self._template_pads = None      # [(x_mm,y_mm,w_mm,h_mm), ...] gerber原始焊盘
+        self._tpl_s = 1.0               # 模板位姿: mm→显示帧像素 缩放
+        self._tpl_theta = 0.0           # 旋转(弧度)
+        self._tpl_tx = 0.0              # 平移(显示帧像素)
+        self._tpl_ty = 0.0
+        self._template_mode = False     # True=手势控模板, False=手势控视图
+        self._tpl_last_pan = None       # 模板平移手势上一帧中心
+        self._tpl_excluded = set()      # 被点击排除(不点锡)的模板焊盘索引
 
 
     def _setRoundedPixmap(self, pixmap):
@@ -315,9 +325,9 @@ class PinchZoomLabel(QLabel):
 
 
     def paintEvent(self, event):
-        """重写paintEvent: 使用QPainterPath实现圆角裁剪显示图像"""
+        """重写paintEvent: 圆角裁剪显示图像 + 叠加Gerber模板蒙版"""
         if self._current_display:
-            from PyQt5.QtGui import QPainter, QPainterPath
+            from PyQt5.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush
             from PyQt5.QtCore import QRectF
             painter = QPainter(self)
             painter.setRenderHint(QPainter.Antialiasing)
@@ -330,9 +340,113 @@ class PinchZoomLabel(QLabel):
             x = (self.width() - pm.width()) // 2
             y = (self.height() - pm.height()) // 2
             painter.drawPixmap(x, y, pm)
+            # 叠加Gerber模板蒙版(若已加载)
+            if self._template_pads and self._original_pixmap:
+                self._paint_template(painter)
             painter.end()
         else:
             super().paintEvent(event)
+
+    def _frame_px_to_screen(self, u, v):
+        """显示帧像素(u,v) → 屏幕坐标(sx,sy)。与_apply_transform的裁剪逻辑一致。"""
+        pm = self._original_pixmap
+        if not pm:
+            return None
+        pw, ph = pm.width(), pm.height()
+        label_w, label_h = self.width(), self.height()
+        base = min(label_w / pw, label_h / ph)
+        if self._zoom <= 1.0:
+            disp_w, disp_h = pw * base, ph * base
+            off_x = (label_w - disp_w) / 2.0
+            off_y = (label_h - disp_h) / 2.0
+            return (off_x + u * base, off_y + v * base)
+        sw = pw * base * self._zoom
+        sh = ph * base * self._zoom
+        cx = sw / 2 - self._pan_x
+        cy = sh / 2 - self._pan_y
+        crop_x = max(0, min(cx - label_w / 2, sw - label_w))
+        crop_y = max(0, min(cy - label_h / 2, sh - label_h))
+        disp = self._current_display
+        disp_w = disp.width() if disp else label_w
+        disp_h = disp.height() if disp else label_h
+        off_x = (label_w - disp_w) / 2.0
+        off_y = (label_h - disp_h) / 2.0
+        return (off_x + u * base * self._zoom - crop_x,
+                off_y + v * base * self._zoom - crop_y)
+
+    def _tpl_to_frame_px(self, x_mm, y_mm):
+        """模板焊盘gerber坐标(mm) → 显示帧像素。位姿: 缩放s 旋转theta 平移(tx,ty)。
+        注: gerber Y向上, 图像Y向下, 用-y翻转，旋转由用户对齐吸收。"""
+        import math
+        c, s = math.cos(self._tpl_theta), math.sin(self._tpl_theta)
+        xs, ys = x_mm * self._tpl_s, -y_mm * self._tpl_s
+        u = c * xs - s * ys + self._tpl_tx
+        v = s * xs + c * ys + self._tpl_ty
+        return u, v
+
+    def _paint_template(self, painter):
+        """绘制模板焊盘(半透明)。排除的画红色+叉。超出画面被圆角clip。"""
+        from PyQt5.QtGui import QColor, QPen, QBrush
+        from PyQt5.QtCore import QRectF, QPointF
+        for i, pad in enumerate(self._template_pads):
+            x_mm, y_mm = pad[0], pad[1]
+            w_mm = pad[2] if len(pad) > 2 else 0.6
+            h_mm = pad[3] if len(pad) > 3 else 0.6
+            u, v = self._tpl_to_frame_px(x_mm, y_mm)
+            sp = self._frame_px_to_screen(u, v)
+            if sp is None:
+                continue
+            rw = max(2.0, w_mm * self._tpl_s * self._screen_per_frame())
+            rh = max(2.0, h_mm * self._tpl_s * self._screen_per_frame())
+            excluded = i in self._tpl_excluded
+            if excluded:
+                painter.setPen(QPen(QColor(255, 60, 60, 230), 1))
+                painter.setBrush(QBrush(QColor(255, 60, 60, 70)))
+            else:
+                painter.setPen(QPen(QColor(0, 200, 255, 220), 1))
+                painter.setBrush(QBrush(QColor(0, 200, 255, 90)))
+            painter.drawRect(QRectF(sp[0] - rw / 2, sp[1] - rh / 2, rw, rh))
+            if excluded:
+                # 画红叉标记排除
+                painter.setPen(QPen(QColor(255, 60, 60, 255), 1.5))
+                r = max(rw, rh) / 2
+                painter.drawLine(QPointF(sp[0]-r, sp[1]-r), QPointF(sp[0]+r, sp[1]+r))
+                painter.drawLine(QPointF(sp[0]-r, sp[1]+r), QPointF(sp[0]+r, sp[1]-r))
+
+    def _screen_per_frame(self):
+        """显示帧像素 → 屏幕像素 的当前比例(用于模板焊盘尺寸)。"""
+        pm = self._original_pixmap
+        if not pm:
+            return 1.0
+        base = min(self.width() / pm.width(), self.height() / pm.height())
+        return base * (self._zoom if self._zoom > 1.0 else 1.0)
+
+    def set_template(self, pads):
+        """设置模板焊盘列表[(x_mm,y_mm,w_mm,h_mm),...]; None清除。初始位姿自动居中铺满。"""
+        self._template_pads = pads
+        self._tpl_excluded = set()  # 新模板清空排除
+        if pads and self._original_pixmap:
+            import math
+            xs = [p[0] for p in pads]; ys = [p[1] for p in pads]
+            minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+            span_mm = max(maxx - minx, maxy - miny, 1.0)
+            pw = self._original_pixmap.width()
+            # 初始缩放: 让模板包络占显示帧约70%
+            self._tpl_s = (pw * 0.7) / span_mm
+            self._tpl_theta = 0.0
+            # 平移: 模板中心 → 显示帧中心
+            cxm, cym = (minx + maxx) / 2, (miny + maxy) / 2
+            self._tpl_tx = pw / 2 - self._tpl_s * cxm
+            self._tpl_ty = pw / 2 + self._tpl_s * cym  # +因Y翻转
+        self.update()
+
+    def set_template_mode(self, on):
+        """切换手势目标: True=控模板, False=控视图。"""
+        self._template_mode = bool(on)
+
+    def get_template_pose(self):
+        """返回当前模板位姿(s,theta,tx,ty), 供对齐确认时换算坐标。"""
+        return (self._tpl_s, self._tpl_theta, self._tpl_tx, self._tpl_ty)
 
     def _apply_transform(self):
         """根据当前zoom/pan计算裁剪区域，生成_current_display并触发重绘"""
@@ -433,10 +547,37 @@ class PinchZoomLabel(QLabel):
 
                 if 0 <= x_ratio <= 1 and 0 <= y_ratio <= 1:
                     main_win = self.window()
+                    # 对位态(有蒙版且非模板手势模式): 点击切换焊盘排除
+                    if self._template_pads and not self._template_mode:
+                        if self._toggle_pad_at_screen(ev.x(), ev.y()):
+                            self._press_pos = None
+                            super().mouseReleaseEvent(ev)
+                            return
                     if hasattr(main_win, '_on_image_clicked'):
                         main_win._on_image_clicked(x_ratio, y_ratio)
         self._press_pos = None
         super().mouseReleaseEvent(ev)
+
+    def _toggle_pad_at_screen(self, sx, sy):
+        """屏幕点(sx,sy)命中某模板焊盘则切换其排除状态。命中返回True。"""
+        if not self._template_pads:
+            return False
+        best_i, best_d = -1, 1e9
+        for i, pad in enumerate(self._template_pads):
+            u, v = self._tpl_to_frame_px(pad[0], pad[1])
+            spx, spy = self._frame_px_to_screen(u, v)
+            d = (spx - sx) ** 2 + (spy - sy) ** 2
+            if d < best_d:
+                best_d, best_i = d, i
+        # 命中阈值: 18px半径
+        if best_i >= 0 and best_d <= 18 * 18:
+            if best_i in self._tpl_excluded:
+                self._tpl_excluded.discard(best_i)
+            else:
+                self._tpl_excluded.add(best_i)
+            self.update()
+            return True
+        return False
 
     def event(self, ev):
         """事件分发：拦截手势事件交给_gesture_event处理"""
@@ -445,21 +586,39 @@ class PinchZoomLabel(QLabel):
         return super().event(ev)
 
     def _gesture_event(self, ev):
-        """处理QPinchGesture：更新缩放比例和平移偏移"""
+        """处理QPinchGesture：模板模式改模板位姿，否则改视图缩放/平移"""
         self._gesture_active = True
         self._gesture_in_progress = True
         pinch = ev.gesture(Qt.PinchGesture)
         if pinch:
             if pinch.state() == Qt.GestureUpdated:
-                scale_factor = pinch.scaleFactor()
-                self._zoom = max(self._min_zoom, min(self._max_zoom, self._zoom * scale_factor))
-                # 平移
-                delta = pinch.centerPoint() - pinch.lastCenterPoint()
-                self._pan_x += delta.x()
-                self._pan_y += delta.y()
-                self._apply_transform()
+                if self._template_mode and self._template_pads:
+                    # 控模板: 缩放+旋转+平移
+                    import math
+                    sf = pinch.scaleFactor()
+                    self._tpl_s = max(1e-3, self._tpl_s * sf)
+                    # 旋转(QPinchGesture rotationAngle增量, 度)
+                    try:
+                        d_rot = pinch.rotationAngle() - pinch.lastRotationAngle()
+                    except Exception:
+                        d_rot = 0.0
+                    self._tpl_theta += math.radians(d_rot)
+                    # 平移(屏幕像素增量 → 显示帧像素增量)
+                    delta = pinch.centerPoint() - pinch.lastCenterPoint()
+                    spf = self._screen_per_frame() or 1.0
+                    self._tpl_tx += delta.x() / spf
+                    self._tpl_ty += delta.y() / spf
+                    self.update()
+                else:
+                    # 控视图: 原逻辑
+                    scale_factor = pinch.scaleFactor()
+                    self._zoom = max(self._min_zoom, min(self._max_zoom, self._zoom * scale_factor))
+                    delta = pinch.centerPoint() - pinch.lastCenterPoint()
+                    self._pan_x += delta.x()
+                    self._pan_y += delta.y()
+                    self._apply_transform()
             elif pinch.state() == Qt.GestureFinished:
-                if self._zoom < 1.05:
+                if not self._template_mode and self._zoom < 1.05:
                     self._zoom = 1.0
                     self._pan_x = 0.0
                     self._pan_y = 0.0
@@ -567,6 +726,59 @@ class IOSStepper(QWidget):
         """设置步进器值(自动约束范围)"""
         self._value = max(self._min, min(self._max, v))
         self._update_display()
+
+
+class PadPreview(QWidget):
+    """Gerber焊盘分布缩略预览(选文件/选面时显示)。白底黑点圆角,顶视。"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pads = []
+        self.setMinimumSize(160, 160)
+
+    def set_pads(self, pads, outline=None):
+        self._pads = pads or []
+        self._outline = outline  # (minx,miny,maxx,maxy)mm 板框
+        self.update()
+
+    def paintEvent(self, ev):
+        from PyQt5.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush
+        from PyQt5.QtCore import QRectF
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 8, 8)
+        qp.setClipPath(path)
+        qp.fillRect(0, 0, W, H, QColor(255, 255, 255))
+        if not self._pads:
+            qp.setPen(QColor(150, 150, 150))
+            qp.drawText(self.rect(), Qt.AlignCenter, "无预览")
+            return
+        # 优先用板框范围定坐标系(看得出焊盘在板上哪),无板框则用焊盘包络
+        ol = getattr(self, '_outline', None)
+        if ol:
+            minx, miny, maxx, maxy = ol
+        else:
+            xs = [p[0] for p in self._pads]; ys = [p[1] for p in self._pads]
+            minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+        m = 12
+        span = max(maxx - minx, maxy - miny, 1.0)
+        s = min(W - 2 * m, H - 2 * m) / span
+        ox = m + (W - 2 * m - (maxx - minx) * s) / 2
+        oy = m + (H - 2 * m - (maxy - miny) * s) / 2
+        def to_px(x, y):
+            return (ox + (x - minx) * s, oy + (maxy - y) * s)  # Y翻转顶视
+        # 板框矩形
+        if ol:
+            x0, y0 = to_px(minx, maxy); x1, y1 = to_px(maxx, miny)
+            qp.setPen(QPen(QColor(0, 150, 70), 1.5)); qp.setBrush(Qt.NoBrush)
+            qp.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+        # 焊盘
+        qp.setPen(QPen(QColor(40, 40, 40), 1))
+        qp.setBrush(QBrush(QColor(40, 40, 40)))
+        for p in self._pads:
+            px, py = to_px(p[0], p[1])
+            qp.drawEllipse(QPointF(px, py), 1.4, 1.4)
 
 
 # ============================================================
@@ -1081,7 +1293,7 @@ class MainWindow(QMainWindow):
         side_v.setSpacing(S(6))
         # 上: 轨迹图(占据侧栏主要空间)
         self._traj_widget = TrajectoryWidget()
-        self._traj_widget.setMinimumHeight(S(260))
+        self._traj_widget.setMinimumHeight(S(170))
         side_v.addWidget(self._traj_widget, 1)
         # 中: XYZ实时坐标(横排一栏, 小字, 矮)
         coord_box = QGroupBox("实时坐标")
@@ -1111,6 +1323,32 @@ class MainWindow(QMainWindow):
         sstat_h.addStretch(1)
         side_v.addWidget(sstat_box)
         # 下: 急停 + 回原点
+        # Gerber对位 + 模板操作 按钮
+        gbtn = QHBoxLayout()
+        gbtn.setSpacing(S(8))
+        self._btn_gerber = QPushButton("▦ Gerber对位")
+        self._btn_gerber.setFixedHeight(S(40))
+        self._btn_gerber.setStyleSheet(f"font-size: {S(12)}px; font-weight: 600; background: #007aff; color: white; border: none; border-radius: {S(6)}px;")
+        self._btn_gerber.clicked.connect(self._gerber_align_start)
+        self._btn_tpl_mode = QPushButton("✥ 模板操作")
+        self._btn_tpl_mode.setCheckable(True)
+        self._btn_tpl_mode.setFixedHeight(S(40))
+        self._btn_tpl_mode.setStyleSheet(
+            f"QPushButton {{ font-size: {S(12)}px; font-weight: 600; background: #8e8e93; color: white; border: none; border-radius: {S(6)}px; }}"
+            f"QPushButton:checked {{ background: #ff9500; }}")
+        self._btn_tpl_mode.setEnabled(False)
+        self._btn_tpl_mode.clicked.connect(self._toggle_template_mode)
+        self._btn_gerber_cancel = QPushButton("✕")
+        self._btn_gerber_cancel.setFixedHeight(S(40))
+        self._btn_gerber_cancel.setFixedWidth(S(40))
+        self._btn_gerber_cancel.setStyleSheet(f"font-size: {S(13)}px; font-weight: 700; background: #ff3b30; color: white; border: none; border-radius: {S(6)}px;")
+        self._btn_gerber_cancel.setVisible(False)
+        self._btn_gerber_cancel.clicked.connect(self._gerber_cancel)
+        gbtn.addWidget(self._btn_gerber)
+        gbtn.addWidget(self._btn_tpl_mode)
+        gbtn.addWidget(self._btn_gerber_cancel)
+        side_v.addLayout(gbtn)
+
         sbtn = QHBoxLayout()
         sbtn.setSpacing(S(8))
         self._btn_solder_estop = QPushButton("🛑 急停")
@@ -1449,6 +1687,25 @@ class MainWindow(QMainWindow):
             self.btn_aoi.setChecked(mode == "aoi")
             self.btn_debug.setChecked(mode == "debug")
             return
+        # 运行态守卫: 进行中的关键操作未结束时禁止切模式(避免状态错乱/电机失控)
+        busy = None
+        if getattr(self, '_exec_timer', None) and self._exec_timer.isActive():
+            busy = "点锡正在执行(可暂停后终止)"
+        elif getattr(self, '_solder_estopped', False):
+            busy = "急停锁定中,请先回原点解除"
+        elif getattr(self, '_gerber_aligning', False):
+            busy = "Gerber对位进行中,请先确认或取消对位"
+        elif getattr(self, '_xy_calib_active', False):
+            busy = "XY标定进行中,请先完成或取消"
+        elif getattr(self, '_z_calib_active', False):
+            busy = "Z校准进行中,请先完成或取消"
+        if busy:
+            self.log(f"⚠ {busy}, 暂不能切换模式")
+            # 复位按钮选中态到当前模式, 避免按钮停在被点的那个
+            self.btn_solder.setChecked(self.current_mode == "solder")
+            self.btn_aoi.setChecked(self.current_mode == "aoi")
+            self.btn_debug.setChecked(self.current_mode == "debug")
+            return
         # 两种模式使用不同RKNN模型，切换时停止实时线程，避免模型错用
         if self.infer_thread and self.infer_thread.isRunning():
             self.stop_camera()
@@ -1472,6 +1729,9 @@ class MainWindow(QMainWindow):
         """根据当前模式更新按钮可用性和文字(点锡/AOI/调试差异化)"""
         is_solder = self.current_mode == "solder"
         is_debug = self.current_mode == "debug"
+        # 离开点锡模式: 若在Gerber对位中, 清理对位态(蒙版/模板模式/按钮)
+        if not is_solder and getattr(self, '_gerber_aligning', False):
+            self._gerber_cancel()
         # 点锡侧栏(轨迹/坐标/急停回零): 仅点锡模式可见
         if hasattr(self, '_solder_side'):
             self._solder_side.setVisible(is_solder)
@@ -1833,7 +2093,7 @@ class MainWindow(QMainWindow):
         Z = P[:, 2]
         # 退化检测: A秩<3说明XY点近似共线, 无法唯一确定平面
         XY = P[:, :2] - P[:, :2].mean(axis=0)
-        # 尺度无关退化判定: XY两主轴跨度(奇异值)最小的 < 最大的5%% 视为共线
+        # 尺度无关退化判定: XY两主轴跨度(奇异值)最小的 < 最大的5%视为共线
         sv = np.linalg.svd(XY, compute_uv=False)
         if len(sv) < 2 or sv[0] < 1e-6 or sv[-1] / sv[0] < 0.05:
             return (None, None)
@@ -2928,6 +3188,174 @@ class MainWindow(QMainWindow):
             # 执行中禁用回原点; 其余可用
             self._btn_solder_home.setEnabled(not executing)
 
+    # ----------------------------------------------------------
+    # Gerber 蒙版对位
+    # ----------------------------------------------------------
+    def _gerber_align_start(self):
+        """Gerber对位按钮入口: 非对位态→进入选择; 对位态→确认对位。"""
+        if getattr(self, '_gerber_aligning', False):
+            self._gerber_confirm()
+            return
+        if self.current_mode != "solder":
+            self.log("⚠ 请在点锡模式使用Gerber对位")
+            return
+        # 重新进入对位: 让上次确认的gerber路径失效, 须重新确认才能执行(防按旧坐标点)
+        if self.path_result and self.path_result.get('source') == 'gerber':
+            self.path_result = None
+            self.btn_execute.setEnabled(False)
+            self.lbl_path.setText("路径: -- 点 (重新对位中)")
+        if self._xy_calib_M is None:
+            self.log("⚠ 未做XY标定, 无法对位(蒙版无法定位)。请先在调试模式完成XY标定")
+            return
+        dlg = self._build_gerber_dialog()
+        if dlg is None:
+            return
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        sel = getattr(self, '_gerber_sel', None)
+        if not sel or not sel.get('pads'):
+            self.log("⚠ 未选择有效Gerber焊盘")
+            return
+        # 设置模板到视频label, 启用模板操作
+        pads = [(p['x'], p['y'], p['w'], p['h']) for p in sel['pads']]
+        self.video_label.set_template(pads)
+        self._gerber_pads_mm = pads
+        self._gerber_face = sel['face']
+        self._gerber_name = sel['name']
+        self._btn_tpl_mode.setEnabled(True)
+        self._btn_tpl_mode.setChecked(True)
+        self.video_label.set_template_mode(True)
+        self._btn_gerber.setText("✓ 确认对位")
+        self._btn_gerber_cancel.setVisible(True)
+        self._gerber_aligning = True
+        self.lbl_path.setText(f"Gerber: {sel['name']} {sel['face']} {len(pads)}点 待对齐")
+        self.log(f"▦ 已载入 {sel['name']} {sel['face']} {len(pads)}个焊盘。按住[模板操作]双指旋转/缩放/平移对齐, 再点[确认对位]")
+
+    def _build_gerber_dialog(self):
+        """构建Gerber选择弹窗: 文件列表 + 顶/底面 + 焊盘预览。"""
+        import gerber_paste_parser as gpp
+        files = []
+        try:
+            for f in sorted(os.listdir(GERBER_DIR)):
+                if f.lower().endswith(('.zip', '.rar', '.7z')):
+                    files.append(f)
+        except Exception:
+            pass
+        if not files:
+            self.log(f"⚠ {GERBER_DIR} 无gerber文件, 请先用手机/电脑上传")
+            return None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择Gerber + 面")
+        dlg.resize(S(560), S(420))
+        lay = QHBoxLayout(dlg)
+        # 左: 文件列表 + 面选择
+        left = QVBoxLayout()
+        left.addWidget(QLabel("已上传Gerber:"))
+        lst = QListWidget()
+        lst.addItems(files)
+        lst.setCurrentRow(0)
+        left.addWidget(lst, 1)
+        face_row = QHBoxLayout()
+        rb_top = QRadioButton("顶面(GTP)")
+        rb_bot = QRadioButton("底面(GBP)")
+        rb_top.setChecked(True)
+        face_row.addWidget(rb_top); face_row.addWidget(rb_bot)
+        left.addLayout(face_row)
+        btn_row = QHBoxLayout()
+        ok = QPushButton("载入对位"); cancel = QPushButton("取消")
+        btn_row.addWidget(ok); btn_row.addWidget(cancel)
+        left.addLayout(btn_row)
+        lay.addLayout(left, 1)
+        # 右: 预览
+        right = QVBoxLayout()
+        right.addWidget(QLabel("焊盘预览(顶视):"))
+        prev = PadPreview()
+        right.addWidget(prev, 1)
+        lbl_info = QLabel("—")
+        lbl_info.setStyleSheet(f"font-size: {S(11)}px; color: #8e8e93;")
+        right.addWidget(lbl_info)
+        lay.addLayout(right, 1)
+
+        state = {'pads': None}
+
+        def refresh():
+            fn = lst.currentItem().text() if lst.currentItem() else None
+            if not fn:
+                return
+            is_bot = rb_bot.isChecked()
+            ext = ('.gbp',) if is_bot else ('.gtp',)
+            try:
+                res = gpp.extract_paste_targets(os.path.join(GERBER_DIR, fn),
+                                                layer_ext=ext, mirror_x=is_bot)
+                pads = res['pads']
+                prev.set_pads([(p['x'], p['y']) for p in pads], outline=res.get('outline'))
+                mtag = ' [底面已镜像]' if is_bot else ''
+                lbl_info.setText(f"{res['layer_file']}: 贴{res['keep']} / 剔{res['drop']}{mtag}")
+                state['pads'] = pads
+                state['face'] = '底面' if is_bot else '顶面'
+                state['name'] = fn
+            except Exception as e:
+                prev.set_pads([])
+                lbl_info.setText(f"该面无焊盘层: {e}")
+                state['pads'] = None
+
+        lst.currentRowChanged.connect(lambda *_: refresh())
+        rb_top.toggled.connect(lambda *_: refresh())
+        rb_bot.toggled.connect(lambda *_: refresh())
+        ok.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        refresh()
+
+        def on_accept():
+            self._gerber_sel = state if state.get('pads') else None
+        dlg.accepted.connect(on_accept)
+        return dlg
+
+    def _toggle_template_mode(self):
+        """模板操作开关: ON手势控模板, OFF手势控视图。"""
+        on = self._btn_tpl_mode.isChecked()
+        self.video_label.set_template_mode(on)
+        self.log("✥ 模板操作: " + ("开(双指调模板)" if on else "关(双指调视图)"))
+
+    def _gerber_confirm(self):
+        """确认对位: 把模板焊盘(显示帧像素)→机床坐标, 写path_result。"""
+        if not getattr(self, '_gerber_aligning', False) or not getattr(self, '_gerber_pads_mm', None):
+            return
+        pts = []
+        excluded = self.video_label._tpl_excluded
+        for i, (xm, ym, w, h) in enumerate(self._gerber_pads_mm):
+            if i in excluded:
+                continue  # 用户点击排除的焊盘不点
+            u, v = self.video_label._tpl_to_frame_px(xm, ym)  # 显示帧像素(与视觉同坐标系)
+            pts.append({'x': float(u), 'y': float(v), 'w': w, 'h': h})
+        # path_result格式与视觉一致: points为显示帧像素, 执行时统一加disp_offset_x再pixel_to_machine
+        self.path_result = {'points': pts, 'source': 'gerber'}
+        self._path_disp_offset_x = getattr(self, '_path_disp_offset_x', 0)
+        self._traj_done = 0
+        # 退出对位态
+        self._gerber_aligning = False
+        self._btn_gerber.setText("▦ Gerber对位")
+        self._btn_tpl_mode.setChecked(False)
+        self._btn_tpl_mode.setEnabled(False)
+        self.video_label.set_template_mode(False)
+        self.btn_execute.setEnabled(True)
+        self._btn_gerber_cancel.setVisible(False)
+        self.lbl_path.setText(f"路径来源:Gerber {self._gerber_name} {self._gerber_face} {len(pts)}点")
+        self.log(f"✓ 对位确认: {len(pts)}个焊盘已生成点锡路径(来源Gerber)。可执行点锡")
+
+    def _gerber_cancel(self):
+        """取消对位, 清除蒙版。"""
+        self._gerber_aligning = False
+        self.video_label.set_template(None)
+        self.video_label.set_template_mode(False)
+        self._btn_gerber.setText("▦ Gerber对位")
+        self._btn_tpl_mode.setChecked(False)
+        self._btn_tpl_mode.setEnabled(False)
+        self._btn_gerber_cancel.setVisible(False)
+        self.log("▦ 已退出Gerber对位")
+
+
     def _cmd_z_move(self, direction):
         """Z轴步进移动(框架stub)
         Args:
@@ -3132,7 +3560,21 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
-        """窗口关闭事件：停止推理线程，释放资源"""
+        """窗口关闭事件：停止执行状态机/推理线程，释放资源"""
+        # 安全: 关窗前停止点锡执行状态机(避免UI关了电机还在按队列动)
+        try:
+            if getattr(self, '_exec_timer', None) and self._exec_timer.isActive():
+                self._exec_timer.stop()
+                if self._motor is not None:
+                    self._motor.estop()  # 关窗时执行中→急停, 防失控
+        except Exception:
+            pass
+        # 退出Z校准态(若进行中)
+        try:
+            if getattr(self, '_z_calib_active', False):
+                self._z_calib_active = False
+        except Exception:
+            pass
         try:
             if hasattr(self, '_health_thread') and self._health_thread:
                 self._health_thread.stop()
