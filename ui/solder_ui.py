@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QGroupBox, QTextEdit,
-    QProgressBar, QLineEdit, QSizePolicy, QListWidget
+    QProgressBar, QLineEdit, QSizePolicy, QListWidget, QRadioButton
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent, QPointF
 from PyQt5.QtGui import QPainter, QPainterPath, QImage, QPixmap, QFont, QFontDatabase, QColor, QPen, QBrush
