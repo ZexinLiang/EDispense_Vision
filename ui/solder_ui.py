@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QGroupBox, QTextEdit,
-    QProgressBar, QLineEdit, QSizePolicy, QListWidget, QRadioButton
+    QProgressBar, QLineEdit, QSizePolicy, QListWidget, QListWidgetItem, QRadioButton
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent, QPointF
 from PyQt5.QtGui import QPainter, QPainterPath, QImage, QPixmap, QFont, QFontDatabase, QColor, QPen, QBrush
@@ -251,6 +251,407 @@ class NumPadDialog(QDialog):
     def get_value(self):
         """返回用户输入的数值字符串"""
         return self._value or "0"
+
+
+# ============================================================
+# WiFi 配置 (集成于调试面板"系统状态") - 白底 iOS 风格
+# ============================================================
+WIFI_AGENT = "http://192.168.137.222:8765"
+
+
+def _wifi_api_get(path, timeout=20):
+    """GET 点锡机PC上的WiFi代理接口(绕过板子系统代理直连)"""
+    import json as _json, urllib.request as _u
+    opener = _u.build_opener(_u.ProxyHandler({}))
+    r = opener.open(WIFI_AGENT + path, timeout=timeout)
+    return _json.loads(r.read().decode("utf-8"))
+
+
+def _wifi_api_post(path, obj, timeout=40):
+    """POST 到WiFi代理接口(绕过系统代理)"""
+    import json as _json, urllib.request as _u
+    data = _json.dumps(obj).encode("utf-8")
+    req = _u.Request(WIFI_AGENT + path, data=data,
+                     headers={"Content-Type": "application/json"})
+    opener = _u.build_opener(_u.ProxyHandler({}))
+    r = opener.open(req, timeout=timeout)
+    return _json.loads(r.read().decode("utf-8"))
+
+
+class WifiWorker(QThread):
+    """WiFi异步任务线程(扫描/查状态/连接)"""
+    done = pyqtSignal(object)
+    err = pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn())
+        except Exception as e:
+            self.err.emit(str(e))
+
+
+class TouchLineEdit(QLineEdit):
+    """点击即获得焦点并通知外部软键盘的输入框"""
+    tapped = pyqtSignal(object)
+
+    def mousePressEvent(self, ev):
+        super().mousePressEvent(ev)
+        self.tapped.emit(self)
+
+
+class OnScreenKeyboard(QWidget):
+    """白底 iOS 风格触摸软键盘(QWERTY),因系统OSK有bug且怕污染NumPad,故自建。"""
+    keyPressed = pyqtSignal(str)   # 普通字符
+    backspace = pyqtSignal()
+    enter = pyqtSignal()
+
+    ROWS_LOWER = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+    ROWS_UPPER = ["QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"]
+    ROWS_NUM = ["1234567890", "-/:;()$&@\"", ".,?!'#%*+="]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._shift = False
+        self._num = False
+        self._btns = {}
+        self._build()
+
+    def _key_qss(self, wide=False):
+        return (
+            f"QPushButton {{ background:#ffffff; color:#1c1c1e; border:none; "
+            f"border-radius:{S(6)}px; font-size:{S(18)}px; }} "
+            f"QPushButton:pressed {{ background:#c7c9cc; }}"
+        )
+
+    def _func_qss(self):
+        return (
+            f"QPushButton {{ background:#adb3bd; color:#1c1c1e; border:none; "
+            f"border-radius:{S(6)}px; font-size:{S(14)}px; font-weight:600; }} "
+            f"QPushButton:pressed {{ background:#8b909a; }}"
+        )
+
+    def _build(self):
+        self.setStyleSheet(f"background:#d1d5db; border-radius:{S(10)}px;")
+        self._root = QVBoxLayout(self)
+        self._root.setContentsMargins(S(6), S(6), S(6), S(6))
+        self._root.setSpacing(S(6))
+        self._render()
+
+    def _clear_layout(self, lay):
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+            elif it.layout():
+                self._clear_layout(it.layout())
+
+    def _render(self):
+        self._clear_layout(self._root)
+        if self._num:
+            rows = self.ROWS_NUM
+        else:
+            rows = self.ROWS_UPPER if self._shift else self.ROWS_LOWER
+        for ri, row in enumerate(rows):
+            hl = QHBoxLayout()
+            hl.setSpacing(S(5))
+            hl.addStretch()
+            # 第三行前面加功能键
+            if ri == 2:
+                if self._num:
+                    fk = QPushButton("#+=" if not self._shift else "123")
+                    fk.clicked.connect(self._toggle_num2)
+                else:
+                    fk = QPushButton("Shift")
+                    fk.setCheckable(True)
+                    fk.setChecked(self._shift)
+                    fk.clicked.connect(self._toggle_shift)
+                fk.setStyleSheet(self._func_qss())
+                fk.setFixedSize(S(52), S(46))
+                hl.addWidget(fk)
+            for ch in row:
+                b = QPushButton(ch)
+                b.setStyleSheet(self._key_qss())
+                b.setFixedSize(S(40), S(46))
+                b.clicked.connect(lambda _, c=ch: self._emit_char(c))
+                hl.addWidget(b)
+            if ri == 2:
+                bk = QPushButton("删除")
+                bk.setStyleSheet(self._func_qss())
+                bk.setFixedSize(S(52), S(46))
+                bk.clicked.connect(self.backspace.emit)
+                hl.addWidget(bk)
+            hl.addStretch()
+            self._root.addLayout(hl)
+        # 底行: 123/ABC 切换 + 空格 + 完成
+        bottom = QHBoxLayout()
+        bottom.setSpacing(S(5))
+        bottom.addStretch()
+        sw = QPushButton("123" if not self._num else "ABC")
+        sw.setStyleSheet(self._func_qss())
+        sw.setFixedSize(S(64), S(46))
+        sw.clicked.connect(self._toggle_num)
+        bottom.addWidget(sw)
+        sp = QPushButton("空格")
+        sp.setStyleSheet(self._key_qss())
+        sp.setFixedSize(S(220), S(46))
+        sp.clicked.connect(lambda: self._emit_char(" "))
+        bottom.addWidget(sp)
+        en = QPushButton("完成")
+        en.setStyleSheet(
+            f"QPushButton {{ background:#007aff; color:white; border:none; "
+            f"border-radius:{S(6)}px; font-size:{S(15)}px; font-weight:600; }} "
+            f"QPushButton:pressed {{ background:#0051d5; }}"
+        )
+        en.setFixedSize(S(80), S(46))
+        en.clicked.connect(self.enter.emit)
+        bottom.addWidget(en)
+        bottom.addStretch()
+        self._root.addLayout(bottom)
+
+    def _emit_char(self, c):
+        self.keyPressed.emit(c)
+        if self._shift and not self._num:
+            self._shift = False
+            self._render()
+
+    def _toggle_shift(self):
+        self._shift = not self._shift
+        self._render()
+
+    def _toggle_num(self):
+        self._num = not self._num
+        self._shift = False
+        self._render()
+
+    def _toggle_num2(self):
+        self._shift = not self._shift
+        self._render()
+
+
+class WifiDialog(QDialog):
+    """白底 iOS 风格 WiFi 配置弹窗(内置软键盘,盖满父窗口)。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setModal(True)
+        self._worker = None
+        self._active_edit = None
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        self._build()
+        QTimer.singleShot(200, self.do_scan)
+        QTimer.singleShot(400, self.refresh_status)
+
+    def _build(self):
+        self.setStyleSheet("background:rgba(0,0,0,120);")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(S(30), S(20), S(30), S(20))
+
+        card = QWidget()
+        card.setStyleSheet(f"background:#f2f2f7; border-radius:{S(16)}px;")
+        outer.addWidget(card)
+        root = QVBoxLayout(card)
+        root.setContentsMargins(S(22), S(16), S(22), S(16))
+        root.setSpacing(S(10))
+
+        # 顶栏
+        top = QHBoxLayout()
+        title = QLabel("WiFi 配置")
+        title.setStyleSheet(f"color:#1c1c1e; font-size:{S(20)}px; font-weight:700;")
+        top.addWidget(title)
+        top.addStretch()
+        self.btn_scan = QPushButton("刷新")
+        self.btn_scan.setStyleSheet(
+            f"QPushButton {{ background:#e5e5ea; color:#007aff; border:none; "
+            f"border-radius:{S(8)}px; font-size:{S(14)}px; font-weight:600; "
+            f"padding:{S(6)}px {S(16)}px; }} QPushButton:pressed {{ background:#c7c7cc; }}"
+        )
+        self.btn_scan.clicked.connect(self.do_scan)
+        top.addWidget(self.btn_scan)
+        btn_close = QPushButton("关闭")
+        btn_close.setStyleSheet(
+            f"QPushButton {{ background:#e5e5ea; color:#1c1c1e; border:none; "
+            f"border-radius:{S(8)}px; font-size:{S(14)}px; font-weight:600; "
+            f"padding:{S(6)}px {S(16)}px; }} QPushButton:pressed {{ background:#c7c7cc; }}"
+        )
+        btn_close.clicked.connect(self.accept)
+        top.addWidget(btn_close)
+        root.addLayout(top)
+
+        # 状态
+        self.status = QLabel("当前状态：查询中...")
+        self.status.setStyleSheet(f"color:#8e8e93; font-size:{S(13)}px;")
+        root.addWidget(self.status)
+
+        # 主体: 左列表 + 右输入
+        body = QHBoxLayout()
+        body.setSpacing(S(14))
+
+        # 左: WiFi列表
+        left = QVBoxLayout()
+        lbl_list = QLabel("可用 WiFi")
+        lbl_list.setStyleSheet(f"color:#1c1c1e; font-size:{S(13)}px; font-weight:600;")
+        left.addWidget(lbl_list)
+        self.listw = QListWidget()
+        self.listw.setStyleSheet(
+            f"QListWidget {{ background:#ffffff; border:none; border-radius:{S(10)}px; "
+            f"font-size:{S(14)}px; color:#1c1c1e; padding:{S(4)}px; }} "
+            f"QListWidget::item {{ padding:{S(10)}px; border-radius:{S(6)}px; }} "
+            f"QListWidget::item:selected {{ background:#007aff; color:white; }}"
+        )
+        self.listw.itemClicked.connect(self.on_pick)
+        left.addWidget(self.listw, 1)
+        body.addLayout(left, 1)
+
+        # 右: 输入区
+        right = QVBoxLayout()
+        right.setSpacing(S(8))
+        lbl_ssid = QLabel("WiFi 名称")
+        lbl_ssid.setStyleSheet(f"color:#1c1c1e; font-size:{S(13)}px; font-weight:600;")
+        right.addWidget(lbl_ssid)
+        self.ssid_edit = TouchLineEdit()
+        self.ssid_edit.setPlaceholderText("点击选择或输入")
+        self._style_edit(self.ssid_edit)
+        self.ssid_edit.tapped.connect(self._focus_edit)
+        right.addWidget(self.ssid_edit)
+
+        lbl_pwd = QLabel("WiFi 密码")
+        lbl_pwd.setStyleSheet(f"color:#1c1c1e; font-size:{S(13)}px; font-weight:600;")
+        right.addWidget(lbl_pwd)
+        pwd_row = QHBoxLayout()
+        pwd_row.setSpacing(S(6))
+        self.pwd_edit = TouchLineEdit()
+        self.pwd_edit.setPlaceholderText("输入密码")
+        self.pwd_edit.setEchoMode(QLineEdit.Password)
+        self._style_edit(self.pwd_edit)
+        self.pwd_edit.tapped.connect(self._focus_edit)
+        pwd_row.addWidget(self.pwd_edit, 1)
+        self.btn_show = QPushButton("显示")
+        self.btn_show.setCheckable(True)
+        self.btn_show.setStyleSheet(
+            f"QPushButton {{ background:#e5e5ea; color:#1c1c1e; border:none; "
+            f"border-radius:{S(8)}px; font-size:{S(13)}px; padding:{S(8)}px {S(12)}px; }} "
+            f"QPushButton:checked {{ background:#007aff; color:white; }}"
+        )
+        self.btn_show.clicked.connect(self.toggle_pwd)
+        pwd_row.addWidget(self.btn_show)
+        right.addLayout(pwd_row)
+
+        self.btn_conn = QPushButton("连接")
+        self.btn_conn.setStyleSheet(
+            f"QPushButton {{ background:#007aff; color:white; border:none; "
+            f"border-radius:{S(10)}px; font-size:{S(16)}px; font-weight:600; "
+            f"min-height:{S(44)}px; }} QPushButton:pressed {{ background:#0051d5; }} "
+            f"QPushButton:disabled {{ background:#a9a9ad; }}"
+        )
+        self.btn_conn.clicked.connect(self.do_connect)
+        right.addWidget(self.btn_conn)
+        right.addStretch()
+        body.addLayout(right, 1)
+        root.addLayout(body, 1)
+
+        # 软键盘
+        self.kb = OnScreenKeyboard()
+        self.kb.keyPressed.connect(self._kb_char)
+        self.kb.backspace.connect(self._kb_backspace)
+        self.kb.enter.connect(self._kb_enter)
+        root.addWidget(self.kb)
+
+    def _style_edit(self, e):
+        e.setStyleSheet(
+            f"QLineEdit {{ background:#ffffff; border:none; border-radius:{S(10)}px; "
+            f"padding:{S(12)}px; font-size:{S(16)}px; color:#1c1c1e; }} "
+            f"QLineEdit:focus {{ border:2px solid #007aff; }}"
+        )
+
+    # ---- 软键盘交互 ----
+    def _focus_edit(self, e):
+        self._active_edit = e
+        e.setFocus()
+
+    def _kb_char(self, c):
+        e = self._active_edit or self.pwd_edit
+        e.insert(c)
+
+    def _kb_backspace(self):
+        e = self._active_edit or self.pwd_edit
+        e.backspace()
+
+    def _kb_enter(self):
+        # 密码框回车即连接; 否则聚焦密码框
+        if self._active_edit is self.ssid_edit:
+            self._active_edit = self.pwd_edit
+            self.pwd_edit.setFocus()
+        else:
+            self.do_connect()
+
+    # ---- 业务逻辑 ----
+    def toggle_pwd(self):
+        self.pwd_edit.setEchoMode(
+            QLineEdit.Normal if self.btn_show.isChecked() else QLineEdit.Password)
+
+    def on_pick(self, item):
+        self.ssid_edit.setText(item.data(Qt.UserRole))
+        self._active_edit = self.pwd_edit
+        self.pwd_edit.setFocus()
+
+    def _run(self, fn, done):
+        self._worker = WifiWorker(fn)
+        self._worker.done.connect(done)
+        self._worker.err.connect(lambda m: self.status.setText("出错：" + m))
+        self._worker.start()
+
+    def do_scan(self):
+        self.status.setText("正在扫描 WiFi...")
+        self.btn_scan.setEnabled(False)
+
+        def done(res):
+            self.btn_scan.setEnabled(True)
+            self.listw.clear()
+            for n in res.get("networks", []):
+                lock = "加密" if n.get("auth", "").lower() not in ("open", "") else "开放"
+                txt = "%s   %s  %s %s" % (n["ssid"], n.get("signal", ""),
+                                          n.get("band", ""), lock)
+                it = QListWidgetItem(txt)
+                it.setData(Qt.UserRole, n["ssid"])
+                self.listw.addItem(it)
+            self.status.setText("扫描完成，共 %d 个" % self.listw.count())
+        self._run(lambda: _wifi_api_get("/scan"), done)
+
+    def refresh_status(self):
+        def done(res):
+            st = res.get("state", "").lower()
+            if st.startswith("connect") or "已连接" in res.get("state", ""):
+                self.status.setText("已连接：%s   PC地址：%s"
+                                    % (res.get("ssid", ""), res.get("ip", "")))
+            else:
+                self.status.setText("未连接")
+        self._run(lambda: _wifi_api_get("/status"), done)
+
+    def do_connect(self):
+        ssid = self.ssid_edit.text().strip()
+        pwd = self.pwd_edit.text()
+        if not ssid:
+            self.status.setText("请先选择或输入 WiFi 名称")
+            return
+        self.status.setText("正在连接 %s ..." % ssid)
+        self.btn_conn.setEnabled(False)
+
+        def done(res):
+            self.btn_conn.setEnabled(True)
+            if res.get("ok"):
+                self.status.setText("✓ 已连接：%s   PC地址：%s"
+                                    % (res.get("ssid", ""), res.get("ip", "")))
+            else:
+                self.status.setText("✗ 连接失败，请检查密码或信号  (%s)"
+                                    % res.get("state", ""))
+        self._run(lambda: _wifi_api_post("/connect", {"ssid": ssid, "pwd": pwd}), done)
 
 
 class TouchScrollTextEdit(QTextEdit):
@@ -1212,20 +1613,26 @@ class InferenceThread(QThread):
                 x1_crop = cx - crop_size // 2
                 y1_crop = cy - crop_size // 2
                 infer_crop = frame[y1_crop:y1_crop+crop_size, x1_crop:x1_crop+crop_size]
+                # 调用前固化分支决策, 避免远程infer阻塞期间use_remote被health线程改掉
+                # 引发异常落入错误分支(竞态)进而raise杀死整个推理线程→摄像头假死
+                do_remote = bool(self.use_remote and self.remote_client is not None)
                 try:
-                    if self.use_remote and self.remote_client is not None:
+                    if do_remote:
                         bboxes, scores, class_ids = self.remote_client.infer(
-                            infer_crop, conf_thresh=self.conf_thresh)
+                            infer_crop, conf_thresh=self.conf_thresh, timeout=2.0)
                     else:
                         bboxes, scores, class_ids = infer(
                             self.rknn, infer_crop, conf_thresh=self.conf_thresh)
                 except Exception as e:
-                    # 远程单帧失败: 报警并跳过本帧, 保持外部模式等下一帧重试
-                    if self.use_remote:
+                    if do_remote:
+                        # 远程单帧失败: 报警, 本线程立即降级本地, 下一帧改用本地RKNN
                         self.remote_error.emit(str(e))
-                        time.sleep(0.05)
-                        continue
-                    raise
+                        self.use_remote = False
+                    else:
+                        # 本地推理异常: 仅跳过本帧, 绝不raise(否则线程死亡→摄像头假死)
+                        self.remote_error.emit("本地推理异常: " + str(e))
+                    time.sleep(0.05)
+                    continue
                 if len(bboxes) > 0:
                     bboxes[:, [0, 2]] += x1_crop
                     bboxes[:, [1, 3]] += y1_crop
@@ -1547,12 +1954,12 @@ class MainWindow(QMainWindow):
         ibtn = QHBoxLayout()
         ibtn.setSpacing(S(8))
         self.btn_infer_start = QPushButton("▶ 推理开始")
-        self.btn_infer_start.setFixedHeight(S(36))
+        self.btn_infer_start.setFixedHeight(S(40))
         self.btn_infer_start.setStyleSheet(f"font-size: {S(12)}px; font-weight: 600; background: #34c759; color: white; border: none; border-radius: {S(6)}px;")
         self.btn_infer_start.setEnabled(False)
         self.btn_infer_start.clicked.connect(self._on_infer_start)
         self.btn_infer_stop = QPushButton("⊙ 锁定推理")
-        self.btn_infer_stop.setFixedHeight(S(36))
+        self.btn_infer_stop.setFixedHeight(S(40))
         self.btn_infer_stop.setStyleSheet(f"font-size: {S(12)}px; font-weight: 600; background: #8e8e93; color: white; border: none; border-radius: {S(6)}px;")
         self.btn_infer_stop.setEnabled(False)
         self.btn_infer_stop.clicked.connect(self._on_infer_stop)
@@ -1619,11 +2026,11 @@ class MainWindow(QMainWindow):
         sbtn = QHBoxLayout()
         sbtn.setSpacing(S(8))
         self._btn_solder_estop = QPushButton("🛑 急停")
-        self._btn_solder_estop.setFixedHeight(S(48))
+        self._btn_solder_estop.setFixedHeight(S(40))
         self._btn_solder_estop.setStyleSheet(f"font-size: {S(15)}px; font-weight: 700; background: #ff3b30; color: white; border: none; border-radius: {S(8)}px;")
         self._btn_solder_estop.clicked.connect(self._solder_estop)
         self._btn_solder_home = QPushButton("⌂ 回原点")
-        self._btn_solder_home.setFixedHeight(S(48))
+        self._btn_solder_home.setFixedHeight(S(40))
         self._btn_solder_home.setStyleSheet(f"font-size: {S(15)}px; font-weight: 700; background: #5856d6; color: white; border: none; border-radius: {S(8)}px;")
         self._btn_solder_home.clicked.connect(self._solder_home)
         sbtn.addWidget(self._btn_solder_estop)
@@ -3319,6 +3726,16 @@ class MainWindow(QMainWindow):
         status_lay.addStretch()
         status_lay.addWidget(self._dbg_status_txt)
         status_lay.addStretch()
+        self._btn_wifi = QPushButton("WiFi")
+        self._btn_wifi.setStyleSheet(
+            f"QPushButton {{ background:#007aff; color:white; border:none; "
+            f"border-radius:{S(8)}px; font-size:{S(13)}px; font-weight:600; "
+            f"padding:{S(4)}px {S(12)}px; }} "
+            f"QPushButton:pressed {{ background:#0051d5; }}"
+        )
+        self._btn_wifi.setFixedHeight(S(30))
+        self._btn_wifi.clicked.connect(self._open_wifi_dialog)
+        status_lay.addWidget(self._btn_wifi)
         left_col.addWidget(status_grp)
         
         # 实时坐标
@@ -4004,6 +4421,11 @@ class MainWindow(QMainWindow):
                     led, txt = {0: ("⚪", "已停止"), 1: ("🟢", "运动中"), 2: ("🔴", "急停")}.get(st, ("⚪", "已停止"))
                 self._lbl_solder_state_led.setText(led)
                 self._lbl_solder_state_txt.setText(txt)
+
+    def _open_wifi_dialog(self):
+        """打开WiFi配置弹窗(白底iOS风格,内置软键盘)"""
+        dlg = WifiDialog(self)
+        dlg.exec_()
 
     def _update_coord_display(self):
         """更新调试面板的XYZ坐标显示"""

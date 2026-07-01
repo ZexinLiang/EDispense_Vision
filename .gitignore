@@ -5,4 +5,7 @@ output/
 !data/1.jpg
 .DS_Store
 *.bak
-ui/solder_ui.py.pre_exec
+*.bak_*
+*.pre_*
+*.disabled
+modelbak/
