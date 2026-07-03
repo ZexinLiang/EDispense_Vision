@@ -9,3 +9,4 @@ output/
 *.pre_*
 *.disabled
 modelbak/
+*.orig

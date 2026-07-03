@@ -4531,4 +4531,17 @@ if __name__ == '__main__':
     win = MainWindow()
     win.show()
 
+    # 悬浮语音输入按钮 (点击录音 -> PC ASR识别 -> 填入焦点输入框)
+    try:
+        from voice_input import attach_voice_button
+        attach_voice_button(win)
+    except Exception as _e:
+        print("voice button attach failed:", _e)
+
+    try:
+        from cmd_bridge import attach_cmd_bridge
+        attach_cmd_bridge(win)
+    except Exception as _e:
+        print("cmd bridge attach failed:", _e)
+
     sys.exit(app.exec_())
