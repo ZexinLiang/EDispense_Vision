@@ -29,6 +29,7 @@ PC_HOST   = "192.168.137.222"
 ASR_URL   = "http://%s:8010/asr"  % PC_HOST
 CHAT_URL  = "http://%s:8930/chat" % PC_HOST
 STREAM_URL = "http://%s:8930/chat_stream" % PC_HOST
+STOP_URL  = "http://%s:8930/stop" % PC_HOST
 CHAT_TOKEN = "edispense2026"
 CHAT_SESSION = "board"           # 固定会话，保持上下文记忆
 # ---- 录音 ----
@@ -118,10 +119,11 @@ class _ChatThread(QThread):
     done = pyqtSignal(str)
     fail = pyqtSignal(str)
 
-    def __init__(self, text, timeout=300):
+    def __init__(self, text, timeout=300, url=None):
         super().__init__()
         self.text = text
         self.timeout = timeout
+        self.url = url or CHAT_URL
 
     def run(self):
         try:
@@ -227,7 +229,7 @@ class ChatPanel(QFrame):
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addStretch(1)                       # 左弹簧：让标题稍微往中间挪
-        self._title = QLabel("EDispense AI")
+        self._title = QLabel("GenericAgent")
         self._title.setStyleSheet(
             "color:#1c1c1e;font-size:28px;font-weight:500;letter-spacing:1px;"
             "font-family:'%s';" % TITLE_FONT_FAMILY)
@@ -338,7 +340,7 @@ class ChatPanel(QFrame):
         self._btimer.setInterval(500)
         self._btimer.timeout.connect(self._toggle_blink)
 
-        self._add_msg("assistant", "你好，我是 EDispense-AI，有什么可以帮你？")
+        self._add_msg("assistant", "你好，我是 GenericAgent，有什么可以帮你？")
 
     # ---------- 消息渲染（QLabel 气泡，真圆角） ----------
     def _add_msg(self, role, text):
@@ -436,8 +438,8 @@ class ChatPanel(QFrame):
 
     # ---------- 暂停 /stop ----------
     def _on_stop(self):
-        # 不阻塞，独立短超时线程发 /stop（后端绕锁直接 abort）
-        self._st = _ChatThread("/stop", timeout=15)
+        # 不阻塞，独立短超时线程发 /stop（后端独立端点，绕锁直接 abort，不进任务队列）
+        self._st = _ChatThread("/stop", timeout=15, url=STOP_URL)
         self._st.done.connect(self._on_stop_done)
         self._st.fail.connect(lambda m: self._add_msg("system", "暂停失败：%s" % m))
         self._st.start()
@@ -457,7 +459,7 @@ class ChatPanel(QFrame):
         self._set_busy(False)
         self._clear_msgs()
         self._add_msg("system", reply or "已开启新对话")
-        self._add_msg("assistant", "你好，我是 EDispense-AI，有什么可以帮你？")
+        self._add_msg("assistant", "你好，我是 GenericAgent，有什么可以帮你？")
 
     # ---------- 语音 ----------
     def _style_voice(self):

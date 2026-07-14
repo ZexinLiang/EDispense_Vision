@@ -32,7 +32,7 @@ UI内嵌命令桥 (cmd_bridge) — 扩展版
 import socket, json, threading, time
 from PyQt5.QtCore import QObject, pyqtSignal
 
-CMD_HOST = "127.0.0.1"
+CMD_HOST = "0.0.0.0"
 CMD_PORT = 8931
 
 

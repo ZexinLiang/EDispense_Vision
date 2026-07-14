@@ -10,3 +10,4 @@ output/
 *.disabled
 modelbak/
 *.orig
+.ga_backup/

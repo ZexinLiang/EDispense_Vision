@@ -3139,6 +3139,92 @@ class MainWindow(QMainWindow):
             self.log(f"◎ 框{clicked_idx} {state}")
             self._redraw_edit_frame()
 
+    def select_region(self, region="bottom", frac=0.5, action="exclude"):
+        """按区域批量 排除(不点锡)/恢复(点锡) 焊盘, 自动判别 在线推理(视觉) 或 Gerber 路径来源。
+        region: 'top'/'bottom'/'left'/'right' 或 [x0,y0,x1,y1](0~1比例, 左上为原点)
+        frac:  条带宽度比例(仅 top/bottom/left/right 生效); 0.5=半部分, 0.333=三分之一
+        action:'exclude'=该区域不点锡(默认), 'include'=该区域恢复点锡
+        返回受影响焊盘数(int)。
+        """
+        exclude = (str(action).lower() != "include")
+
+        def _mk_region(region, frac):
+            try:
+                f = float(frac)
+            except Exception:
+                f = 0.5
+            f = min(max(f, 0.0), 1.0)
+            if isinstance(region, (list, tuple)) and len(region) == 4:
+                x0, y0, x1, y1 = [float(v) for v in region]
+                return lambda nx, ny: (x0 <= nx <= x1 and y0 <= ny <= y1)
+            r = str(region).lower()
+            if r in ("bottom", "下", "下半", "下半部分", "下方", "底部", "下面"):
+                return lambda nx, ny: ny >= 1.0 - f
+            if r in ("top", "上", "上半", "上半部分", "上方", "顶部", "上面"):
+                return lambda nx, ny: ny <= f
+            if r in ("left", "左", "左半", "左半部分", "左边", "左侧"):
+                return lambda nx, ny: nx <= f
+            if r in ("right", "右", "右半", "右半部分", "右边", "右侧"):
+                return lambda nx, ny: nx >= 1.0 - f
+            return lambda nx, ny: ny >= 1.0 - f
+
+        in_region = _mk_region(region, frac)
+
+        # ---- Gerber 路径来源 ----
+        if getattr(self, "_gerber_pads_mm", None):
+            lbl = self.video_label
+            pm = getattr(lbl, "_original_pixmap", None)
+            if pm is None or pm.width() <= 0 or pm.height() <= 0:
+                self.log("⚠ 区域选择: Gerber显示尺寸未就绪")
+                return 0
+            pmw, pmh = float(pm.width()), float(pm.height())
+            if not hasattr(lbl, "_tpl_excluded") or lbl._tpl_excluded is None:
+                lbl._tpl_excluded = set()
+            n = 0
+            for i, (xm, ym, w, h) in enumerate(self._gerber_pads_mm):
+                u, v = lbl._tpl_to_frame_px(xm, ym)
+                nx, ny = u / pmw, v / pmh
+                if in_region(nx, ny):
+                    if exclude:
+                        if i not in lbl._tpl_excluded:
+                            lbl._tpl_excluded.add(i); n += 1
+                    else:
+                        if i in lbl._tpl_excluded:
+                            lbl._tpl_excluded.discard(i); n += 1
+            self._gerber_build_path()
+            act = "不点锡" if exclude else "恢复点锡"
+            self.log(f"◧ 区域[{region}]批量{act}: {n}个焊盘, Gerber路径已重算")
+            return n
+
+        # ---- 在线推理(视觉) 路径来源 ----
+        if not self.current_detections:
+            self.log("⚠ 区域选择: 当前无检测目标(请先开始推理)")
+            return 0
+        self._frozen = True
+        if not self._edit_mode or len(self._selection_mask) != len(self.current_detections):
+            self._selection_mask = [int(d[2]) == 0 for d in self.current_detections]
+        self._edit_mode = True
+        h, w = self.current_frame.shape[:2]
+        n = 0
+        for i, det in enumerate(self.current_detections):
+            x1, y1, x2, y2 = [float(v) for v in det[0]]
+            nx = ((x1 + x2) / 2.0) / float(w)
+            ny = ((y1 + y2) / 2.0) / float(h)
+            if not in_region(nx, ny):
+                continue
+            if exclude:
+                target = False
+            else:
+                if int(det[2]) != 0:   # 非pad不纳入点锡
+                    continue
+                target = True
+            if self._selection_mask[i] != target:
+                self._selection_mask[i] = target; n += 1
+        self.capture_frame()   # 依新选中态重算路径并显示
+        act = "不点锡" if exclude else "恢复点锡"
+        self.log(f"◧ 区域[{region}]批量{act}: {n}个框, 路径已重算")
+        return n
+
     def capture_frame(self):
         """点锡模式：生成路径；AOI模式：锁定当前帧"""
         if self.current_mode != "solder":
@@ -4118,6 +4204,66 @@ class MainWindow(QMainWindow):
                      f"内点{r['inliers']}/{len(det_px)} rmse={r['rmse']:.1f}px。如有偏差可用点对对位微调")
         except Exception as e:
             self.log(f"⚠ 自动配准异常: {e}, 请手动点对对位")
+
+    def _ga_gerber_prepare(self, filename, face="top"):
+        """AI非模态Gerber入口：按文件名载入并进入人工对位等待态；不生成路径、不点锡。"""
+        import gerber_paste_parser as gpp
+        if self.current_mode != "solder":
+            self.log("⚠ 请在点锡模式使用Gerber对位")
+            return {"ok": False, "error": "not_solder_mode"}
+        if self.infer_thread and getattr(self.infer_thread, 'infer_enabled', False):
+            self.log("⚠ 推理进行中, 请先[推理停止]")
+            return {"ok": False, "error": "inference_running"}
+        if self._xy_calib_M is None:
+            self.log("⚠ 未做XY标定, 无法对位")
+            return {"ok": False, "error": "xy_not_calibrated"}
+        if not (self.infer_thread and self.infer_thread.isRunning()):
+            self.log("⚠ 请先打开摄像头")
+            return {"ok": False, "error": "camera_not_running"}
+        if not filename or not os.path.basename(str(filename)) == str(filename):
+            return {"ok": False, "error": "filename_only"}
+        fn = str(filename)
+        path = os.path.join(GERBER_DIR, fn)
+        if not os.path.isfile(path):
+            self.log(f"⚠ Gerber不存在: {fn}")
+            return {"ok": False, "error": "file_not_found", "filename": fn}
+        is_bot = str(face).lower() in ("bottom", "bot", "底面", "gbp")
+        try:
+            res = gpp.extract_paste_targets(path, layer_ext=(('.gbp',) if is_bot else ('.gtp',)), mirror_x=is_bot)
+            pads = res.get('pads') or []
+        except Exception as e:
+            self.log(f"⚠ Gerber解析失败: {e}")
+            return {"ok": False, "error": "parse_failed", "detail": str(e)}
+        if not pads:
+            return {"ok": False, "error": "no_pads", "layer": res.get('layer_file')}
+        sel = {'pads': pads, 'face': ('底面' if is_bot else '顶面'), 'name': fn}
+        self._gerber_sel = sel
+        if self.path_result and self.path_result.get('source') == 'gerber':
+            self.path_result = None
+            self.btn_execute.setEnabled(False)
+        xy = [(p['x'], p['y'], p['w'], p['h']) for p in pads]
+        self.video_label.set_template(xy)
+        self._gerber_pads_mm = xy
+        self._gerber_face = sel['face']
+        self._gerber_name = fn
+        self._btn_tpl_mode.setEnabled(True)
+        self._btn_tpl_mode.setChecked(False)
+        self.video_label.set_template_mode(False)
+        self._btn_gerber.setText("▦ 退出对位")
+        self._btn_gerber_cancel.setVisible(False)
+        self._pp_btn_widget.setVisible(True)
+        self.video_label.pp_reset()
+        self._btn_pp_mode.setChecked(True)
+        self.video_label.pp_set_mode(True)
+        if self.infer_thread and self.infer_thread.isRunning():
+            self.infer_thread.infer_enabled = False
+        self._frozen = False
+        self._edit_mode = False
+        self._gerber_aligning = True
+        self._update_infer_buttons()
+        self.lbl_path.setText(f"Gerber: {fn} {sel['face']} {len(xy)}点 待对齐")
+        self.log(f"▦ AI已载入 {fn} {sel['face']} {len(xy)}个焊盘，等待人工对位确认")
+        return {"ok": True, "filename": fn, "face": sel['face'], "pads": len(xy), "state": "aligning"}
 
     def _build_gerber_dialog(self):
         """构建Gerber选择弹窗: 文件列表 + 顶/底面 + 焊盘预览。"""
