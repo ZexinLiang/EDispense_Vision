@@ -25,6 +25,16 @@ def api_post(path, obj, timeout=40):
     r = urllib.request.urlopen(req, timeout=timeout)
     return json.loads(r.read().decode("utf-8"))
 
+_LIVE_WORKERS = set()
+
+def _track_worker(worker):
+    _LIVE_WORKERS.add(worker)
+    def release(w=worker):
+        _LIVE_WORKERS.discard(w)
+        w.deleteLater()
+    worker.finished.connect(release)
+    return worker
+
 class Worker(QThread):
     done = pyqtSignal(object)
     err = pyqtSignal(str)
@@ -103,6 +113,7 @@ class WifiConfig(QWidget):
 
     def _run(self, fn, done):
         self.worker = Worker(fn)
+        _track_worker(self.worker)
         self.worker.done.connect(done)
         self.worker.err.connect(lambda m: self.status.setText("出错：" + m))
         self.worker.start()

@@ -32,6 +32,16 @@ STREAM_URL = "http://%s:8930/chat_stream" % PC_HOST
 STOP_URL  = "http://%s:8930/stop" % PC_HOST
 CHAT_TOKEN = "edispense2026"
 CHAT_SESSION = "board"           # 固定会话，保持上下文记忆
+
+# Temporary network threads may outlive repeated taps or a closed panel.
+_LIVE_QTHREADS = set()
+def _track_thread(thread):
+    _LIVE_QTHREADS.add(thread)
+    def release(t=thread):
+        _LIVE_QTHREADS.discard(t)
+        t.deleteLater()
+    thread.finished.connect(release)
+    return thread
 # ---- 录音 ----
 ARECORD_DEV = "hw:1,0"
 WAV_PATH    = "/tmp/voice_input.wav"
@@ -412,6 +422,7 @@ class ChatPanel(QFrame):
         self._input.clear()
         self._set_busy(True)
         self._ct = _StreamChatThread(text)
+        _track_thread(self._ct)
         self._ct.turn.connect(self._on_turn)
         self._ct.done.connect(self._on_reply)
         self._ct.fail.connect(self._on_reply_fail)
@@ -440,6 +451,7 @@ class ChatPanel(QFrame):
     def _on_stop(self):
         # 不阻塞，独立短超时线程发 /stop（后端独立端点，绕锁直接 abort，不进任务队列）
         self._st = _ChatThread("/stop", timeout=15, url=STOP_URL)
+        _track_thread(self._st)
         self._st.done.connect(self._on_stop_done)
         self._st.fail.connect(lambda m: self._add_msg("system", "暂停失败：%s" % m))
         self._st.start()
@@ -451,6 +463,7 @@ class ChatPanel(QFrame):
     # ---------- 新对话 /new ----------
     def _on_new(self):
         self._nt = _ChatThread("/new", timeout=15)
+        _track_thread(self._nt)
         self._nt.done.connect(self._on_new_done)
         self._nt.fail.connect(lambda m: self._add_msg("system", "新对话失败：%s" % m))
         self._nt.start()
@@ -518,6 +531,7 @@ class ChatPanel(QFrame):
         self._voice_state = 2
         self._style_voice()
         self._rt = _RecognizeThread(WAV_PATH)
+        _track_thread(self._rt)
         self._rt.done.connect(self._on_voice_text)
         self._rt.fail.connect(self._on_voice_fail)
         self._rt.start()

@@ -258,6 +258,9 @@ class NumPadDialog(QDialog):
 # ============================================================
 WIFI_AGENT = "http://192.168.137.222:8765"
 
+# 点锡机PC(Intel Edge)的IP: A模式用本地USB相机, B模式从此主机拉MJPEG视频流
+PC_INFER_HOST = "192.168.137.222"
+
 
 def _wifi_api_get(path, timeout=20):
     """GET 点锡机PC上的WiFi代理接口(绕过板子系统代理直连)"""
@@ -277,6 +280,16 @@ def _wifi_api_post(path, obj, timeout=40):
     r = opener.open(req, timeout=timeout)
     return _json.loads(r.read().decode("utf-8"))
 
+
+# Keep WiFi workers alive even if the modal dialog is closed mid-request.
+_LIVE_WIFI_WORKERS = set()
+def _track_wifi_worker(worker):
+    _LIVE_WIFI_WORKERS.add(worker)
+    def release(w=worker):
+        _LIVE_WIFI_WORKERS.discard(w)
+        w.deleteLater()
+    worker.finished.connect(release)
+    return worker
 
 class WifiWorker(QThread):
     """WiFi异步任务线程(扫描/查状态/连接)"""
@@ -440,7 +453,7 @@ class WifiDialog(QDialog):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setModal(True)
-        self._worker = None
+        self._workers = set()
         self._active_edit = None
         if parent is not None:
             self.setGeometry(parent.rect())
@@ -602,10 +615,21 @@ class WifiDialog(QDialog):
         self.pwd_edit.setFocus()
 
     def _run(self, fn, done):
-        self._worker = WifiWorker(fn)
-        self._worker.done.connect(done)
-        self._worker.err.connect(lambda m: self.status.setText("出错：" + m))
-        self._worker.start()
+        worker = WifiWorker(fn)
+        self._workers.add(worker)  # hold each concurrent task until finished
+        _track_wifi_worker(worker)  # lifetime independent of dialog
+        worker.done.connect(done)
+        worker.err.connect(self._on_worker_error)
+        worker.finished.connect(lambda w=worker: self._worker_finished(w))
+        worker.start()
+
+    def _on_worker_error(self, message):
+        self.status.setText("出错：" + message)
+        self.btn_scan.setEnabled(True)
+        self.btn_conn.setEnabled(True)
+
+    def _worker_finished(self, worker):
+        self._workers.discard(worker)
 
     def do_scan(self):
         self.status.setText("正在扫描 WiFi...")
@@ -1566,14 +1590,17 @@ class InferenceThread(QThread):
         self.rknn.init_runtime()
 
     def set_camera(self, cam_id):
-        """设置摄像头输入源：打开设备并配置1920x1080 MJPG 30fps"""
-        self.cam_id = int(cam_id)
-        self.cap = cv2.VideoCapture(self.cam_id)
-        # 设置MJPG编码 + 1920x1080全高清采集
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        """设置摄像头输入源：打开设备并配置1920x1080 MJPG 30fps。
+        cam_id 可为整数(本地USB相机index)或字符串URL(B模式:PC端MJPEG流)。"""
+        self.cam_id = cam_id
+        self.cap = cv2.VideoCapture(cam_id)
+        # 仅本地整数相机才设置采集编码/分辨率；URL流(B模式)不设置以免破坏连接
+        is_local = isinstance(cam_id, int) or (isinstance(cam_id, str) and cam_id.isdigit())
+        if is_local:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.mode = 'camera'
 
     def set_image(self, img):
@@ -1682,37 +1709,43 @@ class CameraPreviewThread(QThread):
 
     def run(self):
         """打开摄像头(MJPG 1920x1080)循环取帧"""
-        self.cap = cv2.VideoCapture(self.cam_id)
-        if not self.cap.isOpened():
-            self.open_failed.emit(self.cam_id)
-            return
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        # 回读实际生效分辨率
-        aw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        ah = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.resolution_ready.emit(aw, ah)
-        self.running = True
-        while self.running:
-            if self.cap and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret:
-                    frame = undistort_cam21(frame, self.cam_id)
-                    self.frame_ready.emit(frame)
+        cap = cv2.VideoCapture(self.cam_id)
+        self.cap = cap
+        try:
+            if not cap.isOpened():
+                self.open_failed.emit(self.cam_id)
+                return
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            # 回读实际生效分辨率
+            aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.resolution_ready.emit(aw, ah)
+            self.running = True
+            while self.running:
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret and self.running:
+                        frame = undistort_cam21(frame, self.cam_id)
+                        self.frame_ready.emit(frame)
+                    elif not ret:
+                        time.sleep(0.01)
                 else:
-                    time.sleep(0.01)
-            else:
-                time.sleep(0.05)
-            time.sleep(0.02)
+                    time.sleep(0.05)
+                time.sleep(0.02)
+        finally:
+            # VideoCapture只能由执行read()的工作线程释放，避免跨线程read/release导致进程崩溃。
+            cap.release()
+            self.cap = None
+            self.running = False
 
     def stop(self):
-        """停止预览并释放摄像头"""
+        """请求停止预览；资源由run()线程在finally中释放。"""
         self.running = False
-        if self.cap:
-            self.cap.release()
-        self.wait()
+        self.requestInterruption()
+        return self.wait(3000)
 
 
 class HealthCheckThread(QThread):
@@ -1784,6 +1817,7 @@ class MainWindow(QMainWindow):
 
         # 外部网口推理 (Win11推理服务)
         self._use_remote = False          # 当前是否使用外部推理
+        self._cam_mode = 'A'              # 摄像头来源: 'A'=RK3588本地USB, 'B'=Intel PC视频流
         self._remote_online = False       # 推理系统在线状态(health轮询结果)
         from remote_infer import RemoteInferClient
         self._remote_client = RemoteInferClient("http://192.168.137.222:8000")
@@ -2469,11 +2503,12 @@ class MainWindow(QMainWindow):
             self.log("⚠ 针尖校准相机已打开")
             return
         try:
-            cam_id = int(self.combo_tip_cam.currentText())
+            _logical = int(self.combo_tip_cam.currentText())
         except (ValueError, AttributeError):
-            cam_id = 23
-        self.log(f"📷 正在打开针尖校准相机 (/dev/video{cam_id}) ...")
-        self._tip_preview = CameraPreviewThread(cam_id)
+            _logical = 23
+        src = self._cam_source(_logical)  # B模式走Intel PC视频流
+        self.log(f"📷 正在打开针尖校准相机 (cam={_logical}, 源={src}) ...")
+        self._tip_preview = CameraPreviewThread(src)
         self._tip_preview.frame_ready.connect(self._on_tip_frame)
         self._tip_preview.resolution_ready.connect(self._on_tip_resolution)
         self._tip_preview.open_failed.connect(self._on_tip_open_failed)
@@ -2483,10 +2518,14 @@ class MainWindow(QMainWindow):
         self.combo_tip_cam.setEnabled(False)
 
     def _close_tip_cam(self):
-        """关闭针尖校准相机预览(手动), 复位按钮与显示。"""
-        was_open = bool(self._tip_preview and self._tip_preview.isRunning())
-        if self._tip_preview:
-            self._tip_preview.stop()
+        """关闭针尖校准相机预览；仅在线程确认退出后释放QThread对象。"""
+        preview = self._tip_preview
+        was_open = bool(preview and preview.isRunning())
+        if preview and not preview.stop():
+            # read()暂未返回时必须保留引用，禁止销毁仍在运行的QThread。
+            self.log("⚠ 针尖校准相机停止超时，后台等待视频读取返回")
+            return False
+        if preview is self._tip_preview:
             self._tip_preview = None
         self.btn_tip_open.setEnabled(True)
         self.btn_tip_close.setEnabled(False)
@@ -2494,6 +2533,7 @@ class MainWindow(QMainWindow):
         if was_open:
             self.log("📷 针尖校准相机已关闭")
             self.video_label.setText("针尖校准相机已关闭")
+        return True
 
     def _on_tip_open_failed(self, cam_id):
         """相机打开失败回调: 警告并复位按钮"""
@@ -2518,11 +2558,19 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------
     # XY 标定 (顶部相机像素 → 机床XY 仿射变换, 3点解算)
     # ----------------------------------------------------------
+    def _cam_source(self, logical_cam):
+        """根据A/B模式返回相机源: A=本地int索引; B=Intel PC视频流URL。
+        logical_cam=逻辑相机号(21顶视/23针尖)。B模式所有相机统一走PC video_feed。"""
+        cam = str(logical_cam).replace("✓", "").replace("✓", "").strip()
+        if getattr(self, '_cam_mode', 'A') == 'B':
+            return f"http://{PC_INFER_HOST}:8000/video_feed?cam={cam}"
+        return int(cam)
+
     def _grab_top_frame(self):
-        """抓取顶部相机(video21)单帧BGR, 失败返回None。临时打开即用即放。"""
+        """抓取顶部相机(逻辑video21)单帧BGR, 失败返回None。A=本地/B=Intel PC流。"""
         try:
-            cam_id = 21
-            cap = cv2.VideoCapture(cam_id)
+            src = self._cam_source(21)
+            cap = cv2.VideoCapture(src)
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
@@ -2532,8 +2580,8 @@ class MainWindow(QMainWindow):
                 if ok:
                     frame = f
             cap.release()
-            # video21顶视相机畸变矫正
-            frame = undistort_cam21(frame, cam_id)
+            # A模式int=21会矫正; B模式URL(int转换失败)自动跳过(PC端已矫正)
+            frame = undistort_cam21(frame, src)
             return frame
         except Exception as e:
             self.log(f"✗ 顶部相机抓帧异常: {e}")
@@ -2951,13 +2999,20 @@ class MainWindow(QMainWindow):
         return TINNING_MODEL_PATH if self.current_mode == "solder" else AOI_MODEL_PATH
 
     def start_camera(self):
-        """启动摄像头实时推理：验证设备→创建InferenceThread→开始"""
-        cam_id = int(self.combo_cam.currentText().replace("✓", "").strip())
-        # 先验证摄像头能否打开
+        """启动摄像头实时推理：验证设备→创建InferenceThread→开始。
+        A模式=RK3588本地USB相机(combo选择的int index)；
+        B模式=从Intel PC通过网线拉MJPEG视频流(http://<PC>:8000/video_feed)。"""
+        if getattr(self, '_cam_mode', 'A') == 'B':
+            _bcam = self.combo_cam.currentText().replace("\u2713","").strip()
+            cam_src = f"http://{PC_INFER_HOST}:8000/video_feed?cam={_bcam}"
+        else:
+            cam_src = int(self.combo_cam.currentText().replace("✓", "").strip())
+        # 先验证摄像头/视频流能否打开
         import cv2 as _cv2
-        _test = _cv2.VideoCapture(cam_id)
+        _test = _cv2.VideoCapture(cam_src)
         if not _test.isOpened():
-            self.log(f"⚠ 摄像头 {cam_id} 无法打开，请检查连接")
+            self.log("⚠ 相机无法打开，请检查连接")
+            _test.release()
             return
         _test.release()
         # 验证通过，启动推理线程
@@ -2969,7 +3024,7 @@ class MainWindow(QMainWindow):
         self.infer_thread.remote_error.connect(lambda m: self.log(f"⚠ 外部推理失败: {m}"))
         # 点锡模式: 纯摄像头(不自动推理, 推理由独立按钮控制); 其他模式(AOI)开摄像头即推理
         self.infer_thread.infer_enabled = (self.current_mode != 'solder')
-        self.infer_thread.set_camera(cam_id)
+        self.infer_thread.set_camera(cam_src)
         self.infer_thread.start()
         self._frozen = False
         self._edit_mode = False
@@ -2981,7 +3036,7 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.lbl_path.setText("路径: -- 点")
-        self.log(f"✓ 摄像头 {cam_id} 已启动")
+        self.log("✓ 相机已启动")
         self._update_infer_buttons()
 
     def stop_camera(self):
@@ -3334,6 +3389,34 @@ class MainWindow(QMainWindow):
         if self.infer_thread is not None:
             self.infer_thread.use_remote = self._use_remote
             self.infer_thread.remote_client = self._remote_client
+
+    def _toggle_cam_mode(self):
+        """切换摄像头来源: A=RK3588本地USB相机 / B=Intel PC视频流(网线MJPEG)。
+        若摄像头正在运行, 停止后用新来源重启, 实现即点即切。"""
+        was_running = (self.infer_thread is not None
+                       and self.infer_thread.isRunning())
+        if self._cam_mode == 'A':
+            self._cam_mode = 'B'
+            self._btn_cam_mode.setText("B")
+            self._btn_cam_mode.setStyleSheet(
+                f"QPushButton {{ background:#007aff; color:white; border:none; "
+                f"border-radius:{S(8)}px; font-size:{S(13)}px; font-weight:600; "
+                f"padding:0; }} "
+                f"QPushButton:pressed {{ background:#0051d5; }}"
+            )
+        else:
+            self._cam_mode = 'A'
+            self._btn_cam_mode.setText("A")
+            self._btn_cam_mode.setStyleSheet(
+                f"QPushButton {{ background:#34c759; color:white; border:none; "
+                f"border-radius:{S(8)}px; font-size:{S(13)}px; font-weight:600; "
+                f"padding:0; }} "
+                f"QPushButton:pressed {{ background:#248a3d; }}"
+            )
+        # 若正在运行, 用新来源重启摄像头
+        if was_running:
+            self.stop_camera()
+            QTimer.singleShot(300, self.start_camera)
 
     def _on_remote_status_changed(self, online):
         """推理系统在线状态变化时更新UI(由后台线程信号触发, 运行在主线程)"""
@@ -3766,6 +3849,15 @@ class MainWindow(QMainWindow):
             return False
         import cv2
         current = self.combo_cam.currentText().strip()
+        # B模式: 相机在Intel PC端, 本地探测无意义, 固定给两路(对应PC video_feed cam=21/23)
+        if getattr(self, '_cam_mode', 'A') == 'B':
+            self.combo_cam.clear()
+            self.combo_cam.addItems(["21", "23"])
+            for _i in range(self.combo_cam.count()):
+                if current.replace("✓", "").strip() in self.combo_cam.itemText(_i):
+                    self.combo_cam.setCurrentIndex(_i)
+                    break
+            return
         self.combo_cam.clear()
         candidates = [21, 23, 25]
         items = []
@@ -3824,6 +3916,17 @@ class MainWindow(QMainWindow):
         self._btn_wifi.setFixedHeight(S(30))
         self._btn_wifi.clicked.connect(self._open_wifi_dialog)
         status_lay.addWidget(self._btn_wifi)
+        # 摄像头来源切换按钮(A=RK3588本地USB / B=Intel PC视频流)
+        self._btn_cam_mode = QPushButton("A")
+        self._btn_cam_mode.setStyleSheet(
+            f"QPushButton {{ background:#34c759; color:white; border:none; "
+            f"border-radius:{S(8)}px; font-size:{S(13)}px; font-weight:600; "
+            f"padding:0; }} "
+            f"QPushButton:pressed {{ background:#248a3d; }}"
+        )
+        self._btn_cam_mode.setFixedSize(S(28), S(28))
+        self._btn_cam_mode.clicked.connect(self._toggle_cam_mode)
+        status_lay.addWidget(self._btn_cam_mode)
         left_col.addWidget(status_grp)
         
         # 实时坐标
